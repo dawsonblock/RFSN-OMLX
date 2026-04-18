@@ -4427,7 +4427,15 @@ class Scheduler:
         if pcm is None:
             return []
 
+        # Prefer the request's own block_table (set on prefix-cache hit or
+        # on restore); fall back to the paged cache manager's view, since
+        # fresh turns never attach a block_table to the request itself.
         block_table = getattr(request, "block_table", None)
+        if block_table is None or not getattr(block_table, "block_ids", None):
+            try:
+                block_table = pcm.get_block_table(request.request_id)
+            except Exception:
+                block_table = None
         if block_table is None:
             return []
 

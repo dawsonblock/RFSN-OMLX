@@ -177,3 +177,42 @@ def test_commit_session_idempotent_on_repeated_finish(tmp_path: Path) -> None:
     s._finalize_session_for_request(req)  # idempotent / atomic rewrite
     loaded = SessionArchiveStore(archive).load("test-model", "sess-idem")
     assert loaded == blocks
+
+
+def test_commit_falls_back_to_paged_cache_block_table_when_request_has_none(
+    tmp_path: Path,
+) -> None:
+    """Fresh cold turns never attach a block_table to the request itself.
+
+    The paged cache manager is the source of truth in that case, reachable
+    via ``get_block_table(request_id)``. Without this fallback,
+    ``_hashes_from_block_table`` silently returns ``[]`` for the most
+    important benchmarked case (cold turn with a session_id) and no
+    manifest is ever written — defeating the feature.
+    """
+    blocks = _hashes("fallback", 3)
+    archive = tmp_path / "sessions"
+
+    class _FakePagedCacheWithTable:
+        def __init__(self, hashes: List[bytes]) -> None:
+            self.blocks = [_FakeBlock(h) for h in hashes]
+            self._table_ids = list(range(len(hashes)))
+
+        def get_block_table(self, request_id):  # noqa: ARG002
+            return SimpleNamespace(
+                block_ids=list(self._table_ids), num_tokens=len(self._table_ids) * 16
+            )
+
+    s = object.__new__(Scheduler)
+    s.session_archive_store = SessionArchiveStore(archive)
+    s.paged_ssd_cache_manager = _FakePagedSSDCache(blocks)
+    s.paged_cache_manager = _FakePagedCacheWithTable(blocks)
+    s.config = SimpleNamespace(model_name="test-model", paged_cache_block_size=16)
+
+    req = _make_request(session_id="sess-fallback")
+    assert getattr(req, "block_table", None) is None
+
+    s._finalize_session_for_request(req)
+
+    loaded = SessionArchiveStore(archive).load("test-model", "sess-fallback")
+    assert loaded == blocks
