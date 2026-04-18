@@ -22,7 +22,7 @@ cache already cover the same ground?
 - **Model**: `mlx-community/Qwen2.5-0.5B-Instruct-4bit` (text-only, 4-bit
   quantized, cached locally — no network fetch).
 - **Python**: `3.10.12` via pyenv (`PYENV_VERSION=3.10.12`).
-- **Package**: `mlx-lm 0.31.2` (pinned commit `dcbf6e3` per pyproject).
+- **Package**: `mlx-lm` pinned to commit `dcbf6e3` (post-0.31.1 API requirement; see `pyproject.toml`).
 - **Hardware**: Apple Silicon, Metal / MLX default device.
 - **Config** (`SchedulerConfig` instantiated per run):
   - `max_num_seqs=1`, `max_num_batched_tokens=8192`
