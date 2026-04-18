@@ -1209,6 +1209,38 @@ def sign_app(app_dir: Path):
         print(f"  ✓ Signed {app_dir}")
 
 
+def _strip_macos_junk(root: Path) -> int:
+    """Delete macOS archive junk (.DS_Store, ._*, __MACOSX) under ``root``.
+
+    These files can be introduced by Finder or by unzipping archives on
+    the build host and have no business in a distributed artifact.
+    Returns the number of entries removed.
+    """
+    removed = 0
+    # Walk bottom-up so we can remove __MACOSX directories after their
+    # contents. Skip symlinked directories to avoid escaping the staging
+    # tree (e.g. the Applications symlink).
+    for dirpath, dirnames, filenames in os.walk(root, topdown=False, followlinks=False):
+        for name in filenames:
+            if name == ".DS_Store" or name.startswith("._"):
+                try:
+                    (Path(dirpath) / name).unlink()
+                    removed += 1
+                except OSError:
+                    pass
+        for name in dirnames:
+            if name == "__MACOSX":
+                d = Path(dirpath) / name
+                if d.is_symlink():
+                    continue
+                try:
+                    shutil.rmtree(d)
+                    removed += 1
+                except OSError:
+                    pass
+    return removed
+
+
 def create_dmg(app_dir: Path):
     """Create DMG installer with Applications symlink for drag-and-drop."""
     print("\n[4/4] Creating DMG...")
@@ -1227,6 +1259,13 @@ def create_dmg(app_dir: Path):
 
     # Copy app bundle to staging
     shutil.copytree(app_dir, dmg_staging / APP_BUNDLE, symlinks=True)
+
+    # Scrub macOS archive junk (.DS_Store, ._*, __MACOSX) from the staged
+    # tree so it never lands in the released DMG. Done before the
+    # Applications symlink is created so the walk cannot follow it.
+    junk = _strip_macos_junk(dmg_staging)
+    if junk:
+        print(f"  Scrubbed {junk} macOS archive junk entries from staging")
 
     # Create Applications symlink
     applications_link = dmg_staging / "Applications"
