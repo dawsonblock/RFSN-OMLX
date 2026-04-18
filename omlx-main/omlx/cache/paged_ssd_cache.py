@@ -759,7 +759,14 @@ class PagedSSDCacheManager(CacheManager):
         return self._cache_dir / subdir / filename
 
     def _scan_existing_files(self) -> None:
-        """Scan cache directory for existing files and build index."""
+        """Scan cache directory for existing files and build index.
+
+        A single corrupt, truncated, or identity-mismatched file MUST NOT
+        poison the scan. Each file is read under its own try/except;
+        unreadable or unusable files are quarantined under
+        ``<cache_dir>/quarantine/`` so they are no longer served but are
+        still available for forensic inspection.
+        """
         logger.info(f"Scanning SSD cache directory: {self._cache_dir}")
 
         scanned = 0
@@ -773,19 +780,58 @@ class PagedSSDCacheManager(CacheManager):
 
             for file_path in subdir_path.glob("*.safetensors"):
                 scanned += 1
+                metadata = None
                 try:
                     metadata = self._read_file_metadata(file_path)
-                    if metadata:
-                        self._index.add(metadata)
-                        indexed += 1
                 except Exception as e:
                     logger.warning(f"Failed to read {file_path}: {e}")
+                if metadata is not None:
+                    try:
+                        self._index.add(metadata)
+                        indexed += 1
+                    except Exception as e:
+                        logger.warning(f"Failed to index {file_path}: {e}")
+                        errors += 1
+                else:
+                    # File exists on disk but is not safely loadable as the
+                    # block its filename claims. Quarantine it so the
+                    # active tree stays clean.
+                    self._quarantine_file(file_path, reason="unreadable-or-mismatched")
                     errors += 1
 
         logger.info(
             f"SSD cache scan complete: scanned={scanned}, indexed={indexed}, "
             f"errors={errors}, total_size={format_bytes(self._index.total_size)}"
         )
+
+    def _quarantine_file(self, file_path: Path, *, reason: str) -> None:
+        """Move a bad file under ``<cache_dir>/quarantine/<subdir>/``.
+
+        If the move itself fails (e.g. permission denied), fall back to
+        unlinking so the active tree does not keep re-surfacing the file.
+        """
+        try:
+            quarantine_root = self._cache_dir / "quarantine"
+            subdir = file_path.parent.name or "_"
+            dest_dir = quarantine_root / subdir
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            dest = dest_dir / file_path.name
+            if dest.exists():
+                # Avoid clobbering an earlier quarantined file with the
+                # same name; tag the replacement.
+                dest = dest_dir / f"{file_path.name}.{int(file_path.stat().st_mtime)}"
+            os.replace(str(file_path), str(dest))
+            logger.warning(
+                f"SSD cache quarantined {file_path.name} -> {dest} ({reason})"
+            )
+        except Exception as exc:
+            logger.warning(
+                f"SSD cache failed to quarantine {file_path} ({reason}): {exc}"
+            )
+            try:
+                file_path.unlink()
+            except Exception:
+                pass
 
     def _read_file_metadata(self, file_path: Path) -> Optional[PagedSSDBlockMetadata]:
         """
@@ -806,6 +852,18 @@ class PagedSSDCacheManager(CacheManager):
 
             block_hash_hex = metadata.get("block_hash", "")
             if not block_hash_hex:
+                return None
+
+            # Identity check: the stored block_hash must match the filename
+            # derivation. A mismatch means the file has been tampered with
+            # or was written under a different identity — either way it is
+            # not safe to serve under the filename's claimed hash.
+            expected_hex = file_path.stem.lower()
+            if block_hash_hex.lower() != expected_hex:
+                logger.warning(
+                    f"SSD cache identity mismatch: {file_path.name} "
+                    f"stores block_hash={block_hash_hex[:16]}..., refusing to index"
+                )
                 return None
 
             file_stat = file_path.stat()

@@ -189,6 +189,20 @@ class Request:
     # Cache corruption recovery
     cache_corruption_retries: int = 0   # Per-request corruption retry counter
 
+    # Session archive fields (opt-in; ordinary requests leave both unset).
+    # ``session_id`` names a persistent conversation. ``restore=True`` asks the
+    # scheduler to rebuild cached KV state from the session's manifest before
+    # prefill; it requires an explicit ``session_id``.
+    session_id: Optional[str] = None
+    restore: bool = False
+
+    def __post_init__(self) -> None:
+        if self.restore and not self.session_id:
+            raise ValueError(
+                "restore=True requires an explicit session_id; refusing to "
+                "restore an unnamed session"
+            )
+
     @property
     def num_output_tokens(self) -> int:
         """Number of output tokens generated so far."""

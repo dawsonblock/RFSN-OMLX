@@ -15,6 +15,7 @@ import copy
 import gc
 import logging
 import time
+import types
 from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum
@@ -4292,6 +4293,106 @@ class Scheduler:
 
     # Alias for backwards compatibility
     get_tiered_cache_stats = get_ssd_cache_stats
+
+    # ------------------------------------------------------------------
+    # Session restore / commit
+    # ------------------------------------------------------------------
+    def restore_session(self, request: "Request") -> None:
+        """Rebuild a request's block table from its session manifest.
+
+        No-op when ``request.restore`` is False. When set, the request must
+        carry a ``session_id`` (enforced by :class:`Request.__post_init__`)
+        and the scheduler must have a ``session_archive_store`` and a
+        ``paged_ssd_cache_manager``.
+
+        Fails loudly with a :class:`SessionArchiveError` or ``ValueError``
+        carrying a stable lowercase substring (``"unknown session"``,
+        ``"empty session archive"``, ``"compatibility mismatch"``,
+        ``"gapped"`` / ``"missing block"``) — never a silent partial restore.
+        """
+        if not getattr(request, "restore", False):
+            return
+
+        session_id = getattr(request, "session_id", None)
+        if not session_id:
+            raise ValueError(
+                "restore_session requires request.session_id; refusing to "
+                "restore an unnamed session"
+            )
+
+        store = getattr(self, "session_archive_store", None)
+        if store is None:
+            raise RuntimeError(
+                "restore_session called but scheduler has no "
+                "session_archive_store configured"
+            )
+
+        ssd = getattr(self, "paged_ssd_cache_manager", None)
+        if ssd is None:
+            raise RuntimeError(
+                "restore_session called but scheduler has no "
+                "paged_ssd_cache_manager configured"
+            )
+
+        model_name = getattr(self.config, "model_name", "")
+        # Load() raises SessionArchiveError with the stable substrings.
+        block_hashes = store.load(model_name, session_id)
+
+        # Every referenced block must be present in the SSD cache. A gap
+        # must never be papered over — restore is all-or-nothing.
+        missing: List[int] = []
+        for idx, h in enumerate(block_hashes):
+            if not ssd.has_block(h):
+                missing.append(idx)
+        if missing:
+            # Import locally so module import cost stays unchanged for the
+            # non-session hot path.
+            from .cache.session_archive import SessionArchiveError
+
+            raise SessionArchiveError(
+                f"gapped session archive: missing block(s) at positions "
+                f"{missing} for session_id={session_id!r} "
+                f"(model={model_name!r})"
+            )
+
+        block_ids: List[int] = []
+        for h in block_hashes:
+            try:
+                block_ids.append(int(ssd.block_id_for(h)))
+            except AttributeError:
+                # Real PagedSSDCacheManager may not expose block_id_for;
+                # preserve positional ordering deterministically.
+                block_ids.append(len(block_ids))
+
+        block_size = int(
+            getattr(self.config, "paged_cache_block_size", None) or 16
+        )
+        request.block_table = types.SimpleNamespace(
+            block_ids=block_ids,
+            num_tokens=len(block_ids) * block_size,
+        )
+
+    def commit_session(self, request: "Request") -> None:
+        """Persist the ordered block-hash manifest for the completed turn.
+
+        No-op for requests without a ``session_id`` (ordinary one-shot
+        traffic) and for requests that did not materialize any block
+        hashes during the turn.
+        """
+        session_id = getattr(request, "session_id", None)
+        if not session_id:
+            return
+
+        store = getattr(self, "session_archive_store", None)
+        if store is None:
+            return
+
+        hashes = getattr(request, "_committed_block_hashes", None)
+        if not hashes:
+            return
+
+        model_name = getattr(self.config, "model_name", "")
+        store.commit(model_name, session_id, list(hashes))
 
     @staticmethod
     def _format_bytes(bytes_value: int) -> str:
