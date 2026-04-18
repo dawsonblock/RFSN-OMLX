@@ -1,5 +1,12 @@
 # Session Archive — After-the-Fact Benchmark and Verdict
 
+> **Merge label: experimental / internal — metadata-only session archive
+> for explicit named-session recovery.** Not a latency feature. The paged
+> SSD prefix cache does the real restart work; the session archive is a
+> small operational handle on top of it. Do not expand further (no
+> partial restore, no API / UI / admin surface, no multimodal, no hybrid
+> restore) without a concrete operational use case.
+
 This document records the truth-check of the session archive feature that
 was wired in the previous pass: `Scheduler.restore_session` /
 `commit_session`, the narrow `_hashes_from_block_table` +
