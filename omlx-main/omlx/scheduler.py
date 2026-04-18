@@ -2300,6 +2300,14 @@ class Scheduler:
                 request.prompt_token_ids = list(request.prompt)
             request.num_prompt_tokens = len(request.prompt_token_ids)
 
+        # Session restore: explicit, opt-in. When set, rebuild the block
+        # table from the session manifest *before* the ordinary prefix
+        # cache path runs. restore_session raises loudly on unknown /
+        # malformed / empty / compatibility-mismatch / gapped manifests,
+        # so there is no silent fallback to shared prefix reuse.
+        if getattr(request, "restore", False):
+            self.restore_session(request)
+
         # Check prefix cache for cached KV state
         if self.block_aware_cache is not None:
             # Use paged cache
@@ -3575,6 +3583,17 @@ class Scheduler:
             if self._boundary_snapshot_store is not None:
                 self._boundary_snapshot_store.cleanup_request(request_id)
 
+            # Session archive: commit the block-hash manifest for sessioned
+            # requests. No-op for non-session traffic.
+            req_for_session = self.requests.get(request_id)
+            if req_for_session is not None:
+                try:
+                    self._finalize_session_for_request(req_for_session)
+                except Exception as exc:
+                    logger.warning(
+                        f"Session archive commit failed for {request_id}: {exc}"
+                    )
+
             # Track as finished
             self.finished_req_ids.add(request_id)
 
@@ -4393,6 +4412,60 @@ class Scheduler:
 
         model_name = getattr(self.config, "model_name", "")
         store.commit(model_name, session_id, list(hashes))
+
+    def _hashes_from_block_table(self, request: "Request") -> List[bytes]:
+        """Return the ordered block-hash manifest for ``request``.
+
+        Derives the list from the request's ``block_table.block_ids`` by
+        looking each block id up in ``self.paged_cache_manager.blocks``.
+        Blocks whose hash is ``None`` (newly allocated, not yet sealed)
+        are dropped so a partial/in-progress turn does not commit a gap.
+        Returns an empty list when the request has no block table, no
+        paged cache, or when no sealed blocks exist.
+        """
+        pcm = getattr(self, "paged_cache_manager", None)
+        if pcm is None:
+            return []
+
+        block_table = getattr(request, "block_table", None)
+        if block_table is None:
+            return []
+
+        block_ids = getattr(block_table, "block_ids", None)
+        if not block_ids:
+            return []
+
+        blocks = getattr(pcm, "blocks", None)
+        if blocks is None:
+            return []
+
+        hashes: List[bytes] = []
+        for bid in block_ids:
+            try:
+                block = blocks[bid] if bid < len(blocks) else None
+            except (TypeError, IndexError):
+                block = None
+            if block is None:
+                continue
+            h = getattr(block, "block_hash", None)
+            if h is None:
+                continue
+            hashes.append(h)
+        return hashes
+
+    def _finalize_session_for_request(self, request: "Request") -> None:
+        """Narrow finish-boundary hook.
+
+        Populates ``request._committed_block_hashes`` from the current
+        block table and invokes :meth:`commit_session`. Non-session
+        requests short-circuit via ``commit_session``'s guards; sessioned
+        requests with no sealed blocks also short-circuit without
+        touching the archive.
+        """
+        if not getattr(request, "session_id", None):
+            return
+        request._committed_block_hashes = self._hashes_from_block_table(request)
+        self.commit_session(request)
 
     @staticmethod
     def _format_bytes(bytes_value: int) -> str:
