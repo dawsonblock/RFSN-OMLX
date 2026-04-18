@@ -40,13 +40,18 @@ substring so operators and tests can match on it:
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import tempfile
 from pathlib import Path
 from typing import List, Union
 
+from . import session_archive_metrics as _metrics
+
 __all__ = ["SessionArchiveError", "SessionArchiveStore", "MANIFEST_VERSION"]
+
+_log = logging.getLogger(__name__)
 
 
 MANIFEST_VERSION = "1"
@@ -137,7 +142,9 @@ class SessionArchiveStore:
                 tmp_path.unlink()
             except FileNotFoundError:
                 pass
+            _metrics.bump(_metrics.EVENT_MANIFEST_COMMIT_FAILED)
             raise
+        _metrics.bump(_metrics.EVENT_MANIFEST_COMMITTED)
         return manifest
 
     # ------------------------------------------------------------------
@@ -147,8 +154,23 @@ class SessionArchiveStore:
         """Return the ordered block-hash list for ``(model_name, session_id)``.
 
         Raises :class:`SessionArchiveError` on any failure, with a stable
-        lowercase substring describing the failure class.
+        lowercase substring describing the failure class. Every failure
+        bumps the ``session_archive_invalid`` counter (reason-tagged) so
+        operators can see manifest-health events without changing the
+        raise contract.
         """
+        try:
+            return self._load(model_name, session_id)
+        except SessionArchiveError as exc:
+            reason = _classify_load_error(str(exc))
+            _metrics.bump(_metrics.EVENT_SESSION_ARCHIVE_INVALID, reason=reason)
+            _log.warning(
+                "session archive load failed: model=%r session=%r reason=%s",
+                model_name, session_id, reason,
+            )
+            raise
+
+    def _load(self, model_name: str, session_id: str) -> List[bytes]:
         manifest = self.manifest_path(model_name, session_id)
         if not manifest.exists():
             raise SessionArchiveError(
@@ -202,3 +224,17 @@ class SessionArchiveStore:
             raise SessionArchiveError(
                 f"malformed manifest: {manifest} has non-hex block entries ({exc})"
             ) from exc
+
+
+def _classify_load_error(msg: str) -> str:
+    """Map a SessionArchiveError message to a stable reason tag."""
+    lowered = msg.lower()
+    if "unknown session" in lowered:
+        return "unknown"
+    if "malformed manifest" in lowered:
+        return "malformed"
+    if "empty session archive" in lowered:
+        return "empty"
+    if "compatibility mismatch" in lowered:
+        return "compat"
+    return "unreadable"

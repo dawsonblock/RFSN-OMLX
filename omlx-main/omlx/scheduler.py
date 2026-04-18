@@ -40,6 +40,22 @@ from .request import Request, RequestOutput, RequestStatus, SamplingParams
 from .exceptions import is_cache_corruption_error
 
 
+def _classify_restore_error(msg: str) -> str:
+    """Map a SessionArchiveError message to a stable reason tag for metrics."""
+    lowered = msg.lower()
+    if "unknown session" in lowered:
+        return "unknown"
+    if "malformed manifest" in lowered:
+        return "malformed"
+    if "empty session archive" in lowered:
+        return "empty"
+    if "compatibility mismatch" in lowered:
+        return "compat"
+    if "gapped session archive" in lowered or "missing block" in lowered:
+        return "missing_blocks"
+    return "unreadable"
+
+
 def _sync_and_clear_cache():
     """Synchronize in-flight GPU work before clearing the Metal buffer cache.
 
@@ -3590,6 +3606,8 @@ class Scheduler:
                 try:
                     self._finalize_session_for_request(req_for_session)
                 except Exception as exc:
+                    from .cache import session_archive_metrics as _sa_metrics
+                    _sa_metrics.bump(_sa_metrics.EVENT_MANIFEST_COMMIT_FAILED)
                     logger.warning(
                         f"Session archive commit failed for {request_id}: {exc}"
                     )
@@ -4332,8 +4350,14 @@ class Scheduler:
         if not getattr(request, "restore", False):
             return
 
+        from .cache import session_archive_metrics as _sa_metrics
+        from .cache.session_archive import SessionArchiveError
+
+        _sa_metrics.bump(_sa_metrics.EVENT_RESTORE_ATTEMPTED)
+
         session_id = getattr(request, "session_id", None)
         if not session_id:
+            _sa_metrics.bump(_sa_metrics.EVENT_RESTORE_REJECTED, reason="no_session_id")
             raise ValueError(
                 "restore_session requires request.session_id; refusing to "
                 "restore an unnamed session"
@@ -4341,6 +4365,7 @@ class Scheduler:
 
         store = getattr(self, "session_archive_store", None)
         if store is None:
+            _sa_metrics.bump(_sa_metrics.EVENT_RESTORE_REJECTED, reason="no_store")
             raise RuntimeError(
                 "restore_session called but scheduler has no "
                 "session_archive_store configured"
@@ -4348,6 +4373,7 @@ class Scheduler:
 
         ssd = getattr(self, "paged_ssd_cache_manager", None)
         if ssd is None:
+            _sa_metrics.bump(_sa_metrics.EVENT_RESTORE_REJECTED, reason="no_ssd")
             raise RuntimeError(
                 "restore_session called but scheduler has no "
                 "paged_ssd_cache_manager configured"
@@ -4355,7 +4381,12 @@ class Scheduler:
 
         model_name = getattr(self.config, "model_name", "")
         # Load() raises SessionArchiveError with the stable substrings.
-        block_hashes = store.load(model_name, session_id)
+        try:
+            block_hashes = store.load(model_name, session_id)
+        except SessionArchiveError as exc:
+            reason = _classify_restore_error(str(exc))
+            _sa_metrics.bump(_sa_metrics.EVENT_RESTORE_REJECTED, reason=reason)
+            raise
 
         # Every referenced block must be present in the SSD cache. A gap
         # must never be papered over — restore is all-or-nothing.
@@ -4364,10 +4395,8 @@ class Scheduler:
             if not ssd.has_block(h):
                 missing.append(idx)
         if missing:
-            # Import locally so module import cost stays unchanged for the
-            # non-session hot path.
-            from .cache.session_archive import SessionArchiveError
-
+            _sa_metrics.bump(_sa_metrics.EVENT_SESSION_ARCHIVE_MISSING_BLOCKS)
+            _sa_metrics.bump(_sa_metrics.EVENT_RESTORE_REJECTED, reason="missing_blocks")
             raise SessionArchiveError(
                 f"gapped session archive: missing block(s) at positions "
                 f"{missing} for session_id={session_id!r} "
@@ -4390,6 +4419,7 @@ class Scheduler:
             block_ids=block_ids,
             num_tokens=len(block_ids) * block_size,
         )
+        _sa_metrics.bump(_sa_metrics.EVENT_RESTORE_SUCCEEDED)
 
     def commit_session(self, request: "Request") -> None:
         """Persist the ordered block-hash manifest for the completed turn.

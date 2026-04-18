@@ -824,6 +824,11 @@ class PagedSSDCacheManager(CacheManager):
             logger.warning(
                 f"SSD cache quarantined {file_path.name} -> {dest} ({reason})"
             )
+            try:
+                from . import session_archive_metrics as _sa_metrics
+                _sa_metrics.bump(_sa_metrics.EVENT_SSD_BLOCK_QUARANTINED, reason=reason)
+            except Exception:  # pragma: no cover — metrics must never break IO
+                pass
         except Exception as exc:
             logger.warning(
                 f"SSD cache failed to quarantine {file_path} ({reason}): {exc}"
