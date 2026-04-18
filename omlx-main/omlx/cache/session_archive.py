@@ -2,6 +2,13 @@
 """
 Session archive store.
 
+Status: **experimental / internal**. This module is a named-session
+recovery handle, not a latency feature. Benchmarks show no meaningful
+TTFT win versus a cold restart with a warm shared SSD cache; see
+``docs/session_archive_after.md`` for the measurements that back this
+framing. Do not expand the surface without a concrete operational use
+case.
+
 A *metadata-only* on-disk manifest that records, for a given
 ``(model_name, session_id)`` pair, the ordered list of block hashes that
 make up a conversation's KV state. Manifests reference blocks that live
