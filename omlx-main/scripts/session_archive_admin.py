@@ -63,6 +63,7 @@ from omlx.cache.session_archive_portable import (  # noqa: E402
     BundleError,
     export_session,
     import_session,
+    inspect_bundle,
 )
 
 
@@ -114,6 +115,17 @@ def _build_parser() -> argparse.ArgumentParser:
         dest="session",
         default=None,
         help="Validate a single session; omit to validate every session.",
+    )
+    vp.add_argument(
+        "--stale-after",
+        default=None,
+        type=_parse_duration,
+        help="Optionally grade healthy workspaces as stale after this age.",
+    )
+    vp.add_argument(
+        "--expected-model-name",
+        default=None,
+        help="Optionally grade a workspace incompatible if its model_name differs.",
     )
 
     dp = sub.add_parser("delete", help="Delete one session manifest directory")
@@ -171,6 +183,7 @@ def _build_parser() -> argparse.ArgumentParser:
     cp.add_argument("--session-id", required=True)
     cp.add_argument("--label", default=None)
     cp.add_argument("--description", default=None)
+    cp.add_argument("--task-tag", default=None)
     cp.add_argument("--block-size", type=int, default=None)
 
     stp = sub.add_parser(
@@ -179,6 +192,17 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     stp.add_argument("--model-name", required=True)
     stp.add_argument("--session-id", required=True)
+    stp.add_argument(
+        "--stale-after",
+        default=None,
+        type=_parse_duration,
+        help="Optionally grade healthy workspaces as stale after this age.",
+    )
+    stp.add_argument(
+        "--expected-model-name",
+        default=None,
+        help="Optionally grade the workspace incompatible if model_name differs.",
+    )
 
     rsp = sub.add_parser(
         "resume",
@@ -186,6 +210,17 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     rsp.add_argument("--model-name", required=True)
     rsp.add_argument("--session-id", required=True)
+    rsp.add_argument(
+        "--stale-after",
+        default=None,
+        type=_parse_duration,
+        help="Optionally grade healthy workspaces as stale after this age.",
+    )
+    rsp.add_argument(
+        "--expected-model-name",
+        default=None,
+        help="Optionally grade the workspace incompatible if model_name differs.",
+    )
 
     # ------- Phase 7: lineage / recovery subcommands -------
     tp = sub.add_parser("turns", help="List turns for one session")
@@ -207,6 +242,8 @@ def _build_parser() -> argparse.ArgumentParser:
     fp.add_argument("--at-turn", default=None, help="Turn id to fork from (default: head)")
     fp.add_argument("--label", default=None)
     fp.add_argument("--description", default=None)
+    fp.add_argument("--branch-reason", default=None)
+    fp.add_argument("--task-tag", default=None)
     fp.add_argument("--overwrite", action="store_true")
 
     dfp = sub.add_parser("diff", help="Diff two sessions (metadata only)")
@@ -244,6 +281,12 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Produce a partial bundle instead of failing on missing blocks.",
     )
 
+    ib = sub.add_parser(
+        "inspect-bundle",
+        help="Show bundle provenance + compatibility without mutating anything",
+    )
+    ib.add_argument("--bundle", required=True, type=Path)
+
     ip = sub.add_parser(
         "import-session",
         help="Import a session bundle; verifies sha256 before writing anything",
@@ -263,7 +306,27 @@ def _build_parser() -> argparse.ArgumentParser:
             "this. Guards the compatibility-family invariant."
         ),
     )
-    ip.add_argument("--overwrite-session", action="store_true")
+    ip.add_argument(
+        "--fail-if-exists",
+        action="store_true",
+        help="Explicitly request the default conservative policy: fail on conflict.",
+    )
+    ip.add_argument(
+        "--rename-on-conflict",
+        action="store_true",
+        help="Deterministically rename imported session_id to '<id>-imported-N'.",
+    )
+    ip.add_argument(
+        "--overwrite-session", "--overwrite",
+        dest="overwrite_session",
+        action="store_true",
+        help="Overwrite an existing destination session only with explicit intent.",
+    )
+    ip.add_argument(
+        "--re-root-lineage",
+        action="store_true",
+        help="Clear the imported parent pointer instead of preserving external ancestry.",
+    )
 
     return p
 
@@ -338,12 +401,22 @@ def _cmd_list(store: SessionArchiveStore, args: argparse.Namespace) -> int:
     if not rows:
         print(f"(no sessions for model {args.model!r})")
         return 0
-    print(f"{'SESSION_ID':<40}  {'BLOCKS':>6}  {'SIZE':>6}  {'MTIME':<19}  PATH")
+    print(
+        f"{'SESSION_ID':<24}  {'BLOCKS':>6}  {'MTIME':<19}  {'TAG':<18}  {'LABEL':<20}  PATH"
+    )
     for d in rows:
         blocks = "?" if d.block_count is None else str(d.block_count)
+        label = ""
+        task_tag = ""
+        try:
+            lin = store.lineage(args.model, d.session_id)
+            label = (lin.label or "")[:20]
+            task_tag = (lin.task_tag or "")[:18]
+        except SessionArchiveError:
+            pass
         print(
-            f"{d.session_id:<40}  {blocks:>6}  {d.size_bytes:>6}  "
-            f"{_fmt_mtime(d.mtime):<19}  {d.manifest_path}"
+            f"{d.session_id:<24}  {blocks:>6}  {_fmt_mtime(d.mtime):<19}  "
+            f"{task_tag:<18}  {label:<20}  {d.manifest_path}"
         )
     return 0
 
@@ -367,24 +440,44 @@ def _cmd_show(
     print(f"  version:     {doc.get('version')!r}")
     print(f"  model_name:  {doc.get('model_name')!r}")
     print(f"  session_id:  {doc.get('session_id')!r}")
-    hashes = doc.get("block_hashes") or []
-    print(f"  block_count: {len(hashes)}")
+    print(f"  label:       {doc.get('label')!r}")
+    print(f"  description: {doc.get('description')!r}")
+    print(f"  task_tag:    {doc.get('task_tag')!r}")
+    print(f"  head_turn:   {doc.get('head_turn_id')!r}")
+    print(f"  parent:      {doc.get('parent')!r}")
+    turns = doc.get("turns") or []
+    print(f"  turn_count:  {len(turns)}")
+    if turns:
+        head_note = (turns[-1] or {}).get("note")
+        head_reason = (turns[-1] or {}).get("branch_reason")
+        print(f"  head_note:   {head_note!r}")
+        print(f"  branch_why:  {head_reason!r}")
     status, detail = classify_session(
         store, ssd_cache, args.model, args.session
     )
     print(f"  status:      {status}")
     print(f"  detail:      {detail}")
+    print(f"  grade:       {integrity_grade(status)}")
     return 0 if status == "ok" else 1
 
 
 def _cmd_validate(
     store: SessionArchiveStore, ssd_cache: Any, args: argparse.Namespace
 ) -> int:
+    stale_after_seconds = (
+        args.stale_after.total_seconds() if args.stale_after is not None else None
+    )
     if args.session is not None:
         status, detail = classify_session(
             store, ssd_cache, args.model, args.session
         )
-        grade = integrity_grade(status)
+        grade = classify_integrity(
+            store,
+            args.model,
+            args.session,
+            expected_model_name=args.expected_model_name,
+            stale_after_seconds=stale_after_seconds,
+        ) if status == "ok" else integrity_grade(status)
         print(f"{args.session}\t{status}\t{detail}")
         print(f"grade\t{grade}")
         return 0 if status == "ok" else 1
@@ -396,7 +489,13 @@ def _cmd_validate(
         status, detail = classify_session(
             store, ssd_cache, args.model, d.session_id
         )
-        grade = integrity_grade(status)
+        grade = classify_integrity(
+            store,
+            args.model,
+            d.session_id,
+            expected_model_name=args.expected_model_name,
+            stale_after_seconds=stale_after_seconds,
+        ) if status == "ok" else integrity_grade(status)
         print(f"{d.session_id}\t{status}\t{detail}\tgrade={grade}")
         if status != "ok":
             failures += 1
@@ -493,10 +592,14 @@ def _cmd_turns(store: SessionArchiveStore, args: argparse.Namespace) -> int:
     if not turns:
         print("(no turns)")
         return 0
-    print(f"turn_id\tcommitted_at\tblocks\tnote")
+    print(f"turn_id\tcommitted_at\tblocks\tnote\tbranch_reason")
     for t in turns:
         note = t.note if t.note is not None else ""
-        print(f"{t.turn_id}\t{t.committed_at:.3f}\t{t.block_count}\t{note}")
+        branch_reason = t.branch_reason if t.branch_reason is not None else ""
+        print(
+            f"{t.turn_id}\t{t.committed_at:.3f}\t{t.block_count}\t"
+            f"{note}\t{branch_reason}"
+        )
     return 0
 
 
@@ -523,6 +626,7 @@ def _cmd_lineage(store: SessionArchiveStore, args: argparse.Namespace) -> int:
     print(f"session_id\t{lin.session_id}")
     print(f"label\t{lin.label if lin.label is not None else ''}")
     print(f"description\t{lin.description if lin.description is not None else ''}")
+    print(f"task_tag\t{lin.task_tag if lin.task_tag is not None else ''}")
     print(f"head_turn_id\t{lin.head_turn_id}")
     print(f"parent\t{parent}")
     print(f"turn_count\t{lin.turn_count}")
@@ -545,6 +649,8 @@ def _cmd_fork(store: SessionArchiveStore, args: argparse.Namespace) -> int:
             at_turn=args.at_turn,
             label=args.label,
             description=args.description,
+            branch_reason=args.branch_reason,
+            task_tag=args.task_tag,
             overwrite=args.overwrite,
         )
     except SessionArchiveError as exc:
@@ -642,13 +748,48 @@ def _cmd_export(
             args.out,
             allow_missing_blocks=args.allow_missing_blocks,
         )
+        info = inspect_bundle(args.out)
     except BundleError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
+    env = info["envelope"]
     print(f"path\t{res.path}")
     print(f"block_count\t{res.block_count}")
     print(f"missing_block_count\t{res.missing_block_count}")
     print(f"grade\t{res.grade}")
+    print(f"source_label\t{env.get('source_label') or ''}")
+    print(f"task_tag\t{env.get('task_tag') or ''}")
+    print(f"git_commit\t{env.get('git_commit') or ''}")
+    return 0
+
+
+def _cmd_inspect_bundle(args: argparse.Namespace) -> int:
+    try:
+        info = inspect_bundle(args.bundle)
+    except BundleError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    env = info["envelope"]
+    print(f"bundle_version\t{env.get('bundle_version')}")
+    print(f"model_name\t{env.get('model_name')}")
+    print(f"session_id\t{env.get('session_id')}")
+    print(f"head_turn_id\t{env.get('head_turn_id')}")
+    print(f"source_label\t{env.get('source_label') or ''}")
+    print(f"source_description\t{env.get('source_description') or ''}")
+    print(f"task_tag\t{env.get('task_tag') or ''}")
+    compat = env.get('model_compat') or {}
+    print(
+        f"model_compat\t{compat.get('model_name')} "
+        f"block_size={compat.get('block_size')} schema={compat.get('schema')}"
+    )
+    plat = env.get('platform') or {}
+    print(
+        f"platform\t{plat.get('system')}/{plat.get('machine')} "
+        f"python={plat.get('python')}"
+    )
+    print(f"git_commit\t{env.get('git_commit') or ''}")
+    print(f"exporter_version\t{env.get('exporter_version') or ''}")
+    print(f"block_count\t{env.get('block_count')}")
     return 0
 
 
@@ -661,6 +802,18 @@ def _cmd_import(
             file=sys.stderr,
         )
         return 2
+    if args.rename_on_conflict and args.overwrite_session:
+        print(
+            "error: choose exactly one conflict policy: --rename-on-conflict or --overwrite",
+            file=sys.stderr,
+        )
+        return 2
+    if args.fail_if_exists and (args.rename_on_conflict or args.overwrite_session):
+        print(
+            "error: --fail-if-exists cannot be combined with --rename-on-conflict or --overwrite",
+            file=sys.stderr,
+        )
+        return 2
     try:
         res = import_session(
             store,
@@ -669,15 +822,23 @@ def _cmd_import(
             expected_model_name=args.expected_model_name,
             expected_block_size=args.expected_block_size,
             overwrite_session=args.overwrite_session,
+            rename_on_conflict=args.rename_on_conflict,
+            re_root_lineage=args.re_root_lineage,
         )
     except BundleError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
     print(f"model_name\t{res.model_name}")
     print(f"session_id\t{res.session_id}")
+    print(f"source_session_id\t{res.source_session_id}")
     print(f"manifest_path\t{res.manifest_path}")
     print(f"blocks_written\t{res.blocks_written}")
     print(f"blocks_skipped\t{res.blocks_skipped}")
+    print(f"conflict_policy\t{res.conflict_policy}")
+    print(f"re_rooted\t{res.re_rooted}")
+    print(f"source_label\t{res.provenance.get('source_label') or ''}")
+    print(f"task_tag\t{res.provenance.get('task_tag') or ''}")
+    print(f"git_commit\t{res.provenance.get('git_commit') or ''}")
     return 0
 
 
@@ -694,6 +855,7 @@ def _cmd_create(
             label=args.label,
             description=args.description,
             block_size=args.block_size,
+            task_tag=args.task_tag,
         )
     except SessionArchiveError as exc:
         print(f"error: {exc}", file=sys.stderr)
@@ -710,6 +872,9 @@ def _status_lines(
     ssd_cache: Any,
     model_name: str,
     session_id: str,
+    *,
+    stale_after_seconds: Optional[float] = None,
+    expected_model_name: Optional[str] = None,
 ) -> tuple[int, list[str]]:
     """Build the shared status block. Returns (rc, lines)."""
     lines: list[str] = []
@@ -729,7 +894,16 @@ def _status_lines(
     )
 
     # Grade
-    grade = classify_integrity(store, model_name, session_id)
+    grade = classify_integrity(
+        store,
+        model_name,
+        session_id,
+        expected_model_name=expected_model_name,
+        stale_after_seconds=stale_after_seconds,
+    )
+    last_updated = time.strftime(
+        "%Y-%m-%dT%H:%M:%S", time.localtime(lin.updated_at)
+    ) if lin.updated_at else ""
 
     # Replay probe if ssd cache available and we have a head.
     replayable: Optional[bool] = None
@@ -749,21 +923,37 @@ def _status_lines(
 
     lines.append(f"session_id\t{lin.session_id}")
     lines.append(f"label\t{lin.label if lin.label is not None else ''}")
+    lines.append(f"description\t{lin.description if lin.description is not None else ''}")
+    lines.append(f"task_tag\t{lin.task_tag if lin.task_tag is not None else ''}")
     lines.append(f"head_turn_id\t{lin.head_turn_id}")
     lines.append(f"turn_count\t{lin.turn_count}")
     lines.append(f"parent\t{parent}")
+    if lin.parent is not None:
+        lines.append(f"branch_origin\t{lin.parent[0]}@{lin.parent[1]}")
+    lines.append(f"last_updated\t{last_updated}")
     lines.append(f"has_head\t{has_head}")
     lines.append(
         f"model_compat\t{lin.model_compat.model_name} "
         f"block_size={lin.model_compat.block_size} "
         f"schema={lin.model_compat.schema}"
     )
+    if lin.parent is not None:
+        try:
+            chain = ancestry_chain(store, model_name, session_id)
+            ancestry = " -> ".join(f"{sid}@{tid}" for sid, tid in chain)
+        except SessionArchiveError as exc:
+            ancestry = f"error: {exc}"
+        lines.append(f"ancestry\t{ancestry}")
     if replayable is not None:
         lines.append(f"replayable\t{replayable}")
         lines.append(f"missing_blocks\t{missing_count}")
+    else:
+        lines.append("replayable\tnot_checked")
+        lines.append("missing_blocks\tnot_checked")
     # can-export ≈ has_head and (no ssd probe done OR replayable true)
     can_export = has_head and (replayable is None or replayable)
     lines.append(f"can_export\t{can_export}")
+    lines.append(f"referenced_blocks_resolvable\t{replayable if replayable is not None else 'not_checked'}")
     lines.append(f"grade\t{grade}")
     return 0, lines
 
@@ -771,7 +961,16 @@ def _status_lines(
 def _cmd_status(
     store: SessionArchiveStore, ssd_cache: Any, args: argparse.Namespace
 ) -> int:
-    rc, lines = _status_lines(store, ssd_cache, args.model_name, args.session_id)
+    rc, lines = _status_lines(
+        store,
+        ssd_cache,
+        args.model_name,
+        args.session_id,
+        stale_after_seconds=(
+            args.stale_after.total_seconds() if args.stale_after is not None else None
+        ),
+        expected_model_name=args.expected_model_name,
+    )
     for line in lines:
         print(line)
     return rc
@@ -780,7 +979,16 @@ def _cmd_status(
 def _cmd_resume(
     store: SessionArchiveStore, ssd_cache: Any, args: argparse.Namespace
 ) -> int:
-    rc, lines = _status_lines(store, ssd_cache, args.model_name, args.session_id)
+    rc, lines = _status_lines(
+        store,
+        ssd_cache,
+        args.model_name,
+        args.session_id,
+        stale_after_seconds=(
+            args.stale_after.total_seconds() if args.stale_after is not None else None
+        ),
+        expected_model_name=args.expected_model_name,
+    )
     for line in lines:
         print(line)
     # Derive grade from the last printed grade line.
@@ -864,6 +1072,8 @@ def main(argv: Optional[list] = None) -> int:
         return _cmd_replay_check(store, ssd_cache, args)
     if args.cmd == "export-session":
         return _cmd_export(store, ssd_cache, args)
+    if args.cmd == "inspect-bundle":
+        return _cmd_inspect_bundle(args)
     if args.cmd == "import-session":
         return _cmd_import(store, args)
     parser.error(f"unknown command {args.cmd!r}")

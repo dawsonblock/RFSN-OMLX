@@ -72,18 +72,27 @@ def test_init_workspace_refuses_existing(tmp_path):
 
 def test_init_workspace_then_commit_populates_head(tmp_path):
     store = SessionArchiveStore(tmp_path / "archive")
-    store.init_workspace("m", "ws-1", label="first")
+    store.init_workspace("m", "ws-1", label="first", task_tag="coding.fix")
     # load() must still raise on an empty workspace — the invariant
     # "loading an empty archive fails" is preserved.
     with pytest.raises(SessionArchiveError, match="empty session archive"):
         store.load("m", "ws-1")
-    head = store.commit("m", "ws-1", [_h("a")])
+    head = store.commit("m", "ws-1", [_h("a")], note="checkpoint")
     assert head == "t-00001"
     lin = store.lineage("m", "ws-1")
     assert lin.turn_count == 1
     assert lin.head_turn_id == "t-00001"
     # Label from init_workspace should survive the first commit.
     assert lin.label == "first"
+    assert lin.task_tag == "coding.fix"
+
+
+def test_invalid_metadata_rejected_cleanly(tmp_path):
+    store = SessionArchiveStore(tmp_path / "archive")
+    with pytest.raises(SessionArchiveError, match="task_tag"):
+        store.init_workspace("m", "ws-1", task_tag="not allowed spaces")
+    with pytest.raises(SessionArchiveError, match="label exceeds"):
+        store.init_workspace("m", "ws-2", label="x" * 121)
 
 
 # ---------------------------------------------------------------------------
@@ -98,9 +107,11 @@ def test_ancestry_chain_root_returns_single_entry(tmp_path):
 
 def test_ancestry_chain_walks_parent_links(tmp_path):
     store = SessionArchiveStore(tmp_path / "archive")
-    store.commit("m", "root", [_h("a")])
-    store.commit("m", "root", [_h("a"), _h("b")])  # t-00002
-    store.fork("m", "root", "child", at_turn="t-00001")
+    store.commit("m", "root", [_h("a")], label="bugfix", task_tag="coding.patch")
+    store.commit("m", "root", [_h("a"), _h("b")], note="checkpoint-2")  # t-00002
+    store.fork(
+        "m", "root", "child", at_turn="t-00001", branch_reason="try risky refactor"
+    )
     store.commit("m", "child", [_h("a"), _h("c")])
     store.fork("m", "child", "grand", at_turn="t-00001")
     chain = ancestry_chain(store, "m", "grand")
@@ -182,7 +193,11 @@ def test_cli_create_refuses_existing_workspace(tmp_path):
 def test_cli_status_reports_fields_and_grade(tmp_path):
     root = tmp_path / "archive"
     store = SessionArchiveStore(root)
-    store.commit("m", "ws-1", [_h("a"), _h("b")])
+    store.commit(
+        "m", "ws-1", [_h("a"), _h("b")],
+        label="Implement auth", description="fix failing login flow",
+        task_tag="coding.auth", note="checkpoint 1",
+    )
     res = _run(
         "--archive-root", str(root),
         "status",
@@ -192,10 +207,14 @@ def test_cli_status_reports_fields_and_grade(tmp_path):
     assert res.returncode == 0, res.stderr
     out = res.stdout
     assert "session_id\tws-1" in out
+    assert "label\tImplement auth" in out
+    assert "description\tfix failing login flow" in out
+    assert "task_tag\tcoding.auth" in out
     assert "head_turn_id\tt-00001" in out
     assert "turn_count\t1" in out
     assert "parent\t(root)" in out
     assert "has_head\tTrue" in out
+    assert "replayable\tnot_checked" in out
     assert "can_export\tTrue" in out
     assert "grade\thealthy" in out
 
@@ -217,6 +236,31 @@ def test_cli_status_empty_workspace(tmp_path):
     assert "can_export\tFalse" in res.stdout
 
 
+def test_cli_status_can_surface_stale_and_incompatible(tmp_path):
+    root = tmp_path / "archive"
+    store = SessionArchiveStore(root)
+    store.commit("m", "ws-1", [_h("a")])
+    path = store.manifest_path("m", "ws-1")
+    doc = json.loads(path.read_text("utf-8"))
+    doc["updated_at"] = 1.0
+    path.write_text(json.dumps(doc), encoding="utf-8")
+
+    stale = _run(
+        "--archive-root", str(root), "status",
+        "--model-name", "m", "--session-id", "ws-1", "--stale-after", "1s",
+    )
+    assert stale.returncode == 0
+    assert "grade\tstale" in stale.stdout
+
+    incompatible = _run(
+        "--archive-root", str(root), "status",
+        "--model-name", "m", "--session-id", "ws-1",
+        "--expected-model-name", "other-model",
+    )
+    assert incompatible.returncode == 0
+    assert "grade\tincompatible_model" in incompatible.stdout
+
+
 def test_cli_resume_prints_next_steps(tmp_path):
     root = tmp_path / "archive"
     store = SessionArchiveStore(root)
@@ -228,6 +272,28 @@ def test_cli_resume_prints_next_steps(tmp_path):
     assert res.returncode == 0, res.stderr
     assert "next_steps:" in res.stdout
     assert "grade\thealthy" in res.stdout
+
+
+def test_cli_turns_and_show_surface_branch_reason(tmp_path):
+    root = tmp_path / "archive"
+    store = SessionArchiveStore(root)
+    store.commit("m", "root", [_h("a")], label="base")
+    store.fork(
+        "m", "root", "branch", branch_reason="before risky refactor", task_tag="coding.refactor"
+    )
+    turns = _run(
+        "--archive-root", str(root), "turns",
+        "--model-name", "m", "--session-id", "branch",
+    )
+    assert turns.returncode == 0
+    assert "before risky refactor" in turns.stdout
+    show = _run(
+        "--archive-root", str(root), "show",
+        "--model-name", "m", "--session-id", "branch",
+    )
+    assert show.returncode == 0
+    assert "task_tag:" in show.stdout
+    assert "branch_why:" in show.stdout
 
 
 # ---------------------------------------------------------------------------
@@ -319,3 +385,78 @@ def test_import_rejects_mismatched_block_size(tmp_path):
         dst_store, out, dst_ssd, expected_block_size=16,
     )
     assert res.session_id == "ws-1"
+
+
+def test_import_conflict_policy_default_fail_then_rename_and_reroot(tmp_path):
+    from omlx.cache.session_archive_portable import export_session, import_session, BundleError
+
+    src_archive = tmp_path / "src"
+    ssd = tmp_path / "ssd"
+    ssd.mkdir()
+    store = SessionArchiveStore(src_archive)
+    payload = b"payload-1"
+    h = hashlib.sha256(payload).digest()
+    hp = ssd / h.hex()[0] / f"{h.hex()}.safetensors"
+    hp.parent.mkdir(parents=True, exist_ok=True)
+    hp.write_bytes(payload)
+    store.commit("m", "ws-1", [h], label="Coding task", task_tag="coding.demo")
+    bundle = tmp_path / "bundle.tar"
+    export_session(store, "m", "ws-1", ssd, bundle)
+
+    dst_archive = tmp_path / "dst"
+    dst_store = SessionArchiveStore(dst_archive)
+    dst_store.commit("m", "ws-1", [h], label="Existing")
+
+    with pytest.raises(BundleError, match="default policy: fail"):
+        import_session(dst_store, bundle, tmp_path / "dst_ssd")
+
+    renamed = import_session(
+        dst_store, bundle, tmp_path / "dst_ssd", rename_on_conflict=True, re_root_lineage=True,
+    )
+    assert renamed.session_id == "ws-1-imported-1"
+    assert renamed.conflict_policy == "rename"
+    assert renamed.re_rooted is True
+    imported_doc = dst_store.load_raw("m", renamed.session_id)
+    assert imported_doc["parent"] is None
+
+
+def test_cli_import_and_inspect_bundle_surface_provenance(tmp_path):
+    from omlx.cache.session_archive_portable import export_session
+
+    src_archive = tmp_path / "src"
+    ssd = tmp_path / "ssd"
+    ssd.mkdir()
+    store = SessionArchiveStore(src_archive)
+    payload = b"payload-2"
+    h = hashlib.sha256(payload).digest()
+    hp = ssd / h.hex()[0] / f"{h.hex()}.safetensors"
+    hp.parent.mkdir(parents=True, exist_ok=True)
+    hp.write_bytes(payload)
+    store.commit(
+        "m", "ws-provenance", [h],
+        label="Refactor parser", description="safe branch for AST work",
+        task_tag="coding.parser",
+    )
+    bundle = tmp_path / "bundle.tar"
+    export_session(store, "m", "ws-provenance", ssd, bundle)
+
+    inspect_res = _run(
+        "--archive-root", str(src_archive),
+        "inspect-bundle", "--bundle", str(bundle),
+    )
+    assert inspect_res.returncode == 0, inspect_res.stderr
+    assert "source_label\tRefactor parser" in inspect_res.stdout
+    assert "task_tag\tcoding.parser" in inspect_res.stdout
+    assert "model_compat\tm block_size=" in inspect_res.stdout
+
+    dst_root = tmp_path / "dst"
+    dst_root.mkdir()
+    dst_ssd = tmp_path / "dst_ssd"
+    import_res = _run(
+        "--archive-root", str(dst_root), "--ssd-cache-dir", str(dst_ssd),
+        "import-session", "--bundle", str(bundle),
+        "--expected-model-name", "m", "--fail-if-exists",
+    )
+    assert import_res.returncode == 0, import_res.stderr
+    assert "conflict_policy\tfail" in import_res.stdout
+    assert "source_label\tRefactor parser" in import_res.stdout

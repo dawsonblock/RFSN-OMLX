@@ -159,10 +159,10 @@ working unchanged.
 
 ### 7.1 Vocabulary
 
-- **session**: a named `(model_name, session_id)` pair. One manifest on disk.
+- **session / workspace**: a named `(model_name, session_id)` pair. One manifest on disk. The operator-facing noun is **workspace**.
 - **turn**: a single `commit()` — an ordered list of block hashes
   representing the KV state after that turn. Turn ids are
-  `t-00001`, `t-00002`, … and are assigned by the store.
+  `t-00001`, `t-00002`, … and are assigned by the store. A turn may carry a short `note`; branch turns may also carry a `branch_reason`.
 - **branch / fork**: a new session whose `parent` points at an earlier
   turn of another session. Seeded with the source turn's block list;
   diverges freely after that.
@@ -176,14 +176,18 @@ KV payload bytes.
 
 | Subcommand | Purpose |
 | --- | --- |
-| `turns --model-name M --session-id S` | List every turn of a session (`turn_id`, `committed_at`, block count, note). |
+| `create --model-name M --session-id S [--label L] [--description D] [--task-tag TAG]` | Create an empty workspace manifest with optional human-readable metadata. |
+| `status --model-name M --session-id S [--stale-after 7d] [--expected-model-name M]` | One-screen summary: label, description, task tag, head turn, parent/ancestry, turn count, integrity grade, replay/export readiness. |
+| `resume --model-name M --session-id S` | `status` plus next-step hints (`fork`, `diff`, `export-session`, etc.). |
+| `turns --model-name M --session-id S` | List every turn of a session (`turn_id`, `committed_at`, block count, note, `branch_reason`). |
 | `head --model-name M --session-id S` | Print `head_turn_id` and its block count. |
 | `lineage --model-name M --session-id S` | Session metadata + parent link + turn count + model_compat. |
-| `fork --model-name M --src-session-id SRC --dst-session-id DST --at-turn t-0000N [--label L] [--description D]` | Create a branch session seeded from SRC@turn. Refuses if DST already exists or the source turn is unknown. |
+| `fork --model-name M --src-session-id SRC --dst-session-id DST --at-turn t-0000N [--label L] [--description D] [--branch-reason WHY] [--task-tag TAG]` | Create a branch session seeded from SRC@turn. Refuses if DST already exists or the source turn is unknown. |
 | `diff --model-a MA --session-a SA --model-b MB --session-b SB` | Per-turn diff between two sessions. Shows common prefix, common ancestor (when both sessions share a fork point), and per-turn `a_blocks`/`b_blocks`/`common_prefix`/`diverged`. |
-| `replay-check --model-name M --session-id S [--turn t-0000N]` | Walk a turn's block list and report every hash that is not in the SSD cache. Metadata-only — does not load payloads. Accepts an `expected_model_name` at the Python layer to grade `incompatible_model` without probing the SSD cache. |
-| `export-session --model-name M --session-id S --out BUNDLE.tar [--allow-missing-blocks]` | Write an integrity-verified tarball (`bundle.json` + `manifest.json` + `blocks/<hex>.safetensors`). SHA-256 recorded for every block. Refuses missing blocks unless `--allow-missing-blocks` is passed, in which case the grade degrades to `partially_exportable`. |
-| `import-session --bundle BUNDLE.tar [--expected-model-name M] [--overwrite-session]` | Restore a bundle into `<archive-root>` and `<ssd-cache-dir>`. Verifies every block's SHA-256, rejects path-traversal/symlinks, requires explicit `--overwrite-session` to clobber an existing manifest. |
+| `replay-check --model-name M --session-id S [--turn t-0000N] [--expected-model-name M]` | Walk a turn's block list and report every hash that is not in the SSD cache. Metadata-only — does not load payloads. |
+| `export-session --model-name M --session-id S --out BUNDLE.tar [--allow-missing-blocks]` | Write an integrity-verified tarball (`bundle.json` + `manifest.json` + `blocks/<hex>.safetensors`) with provenance (`source_label`, `task_tag`, `git_commit`, platform, compatibility family). |
+| `inspect-bundle --bundle BUNDLE.tar` | Show bundle provenance and compatibility without mutating archive state. |
+| `import-session --bundle BUNDLE.tar [--expected-model-name M] [--expected-block-size N] [--fail-if-exists | --rename-on-conflict | --overwrite] [--re-root-lineage]` | Restore a bundle into `<archive-root>` and `<ssd-cache-dir>`. Verifies every block's SHA-256, rejects path-traversal/symlinks, and uses a deterministic, explicit conflict policy. |
 
 ### 7.3 Integrity grades
 
@@ -206,6 +210,24 @@ Constants live in [omlx/cache/session_archive.py](../omlx/cache/session_archive.
 maps existing retention statuses to the same vocabulary.
 
 ### 7.4 Bundle format (v1)
+
+Uncompressed tarball, `BUNDLE_VERSION = "1"`.
+The envelope includes metadata-only provenance such as:
+
+- `source_label`
+- `source_description`
+- `task_tag`
+- `model_compat`
+- `platform`
+- `exporter_version`
+- `git_commit` (when available)
+
+Conflict policy is explicit and conservative:
+
+- **default / `--fail-if-exists`**: fail if the destination session already exists,
+- **`--rename-on-conflict`**: rename deterministically to `<session>-imported-N`,
+- **`--overwrite`**: replace only with explicit operator intent,
+- **`--re-root-lineage`**: clear the imported `parent` link instead of preserving an external ancestor.
 
 Uncompressed tarball, `BUNDLE_VERSION = "1"`:
 

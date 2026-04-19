@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: Apache-2.0
 #
-# Canonical workspace-lineage demo.
+# Canonical branchable coding-workspace demo.
 #
-# Walks the full operator loop: create → commit → commit → fork → diff
+# Walks the full operator loop for a local coding task:
+# create → commit → commit → fork before a risky refactor → diff
 # → validate → export → import → resume. Uses only the operator CLI and
 # a tiny inline Python seeder to append turns (the scheduler hook is
 # internal, so for the demo we drive the store directly).
@@ -34,10 +35,12 @@ FORK="alpha-fork"
 
 mkdir -p "$ARCHIVE_A" "$ARCHIVE_B" "$SSD"
 
-echo "== 1. create empty workspace =="
+echo "== 1. create coding workspace =="
 "$PYTHON" "$CLI" --archive-root "$ARCHIVE_A" create \
     --model-name "$MODEL" --session-id "$WS" \
-    --label "demo" --description "workspace lineage demo" --block-size 16
+    --label "Fix parser regression" \
+    --description "branchable coding workspace demo" \
+    --task-tag "coding.parser" --block-size 16
 
 echo "== 2. seed two turns + two blocks on SSD =="
 "$PYTHON" - "$ARCHIVE_A" "$SSD" "$MODEL" "$WS" <<'PY'
@@ -59,19 +62,21 @@ def seed(payload_bytes: bytes) -> bytes:
 
 h1 = seed(b"block-one" * 8)
 h2 = seed(b"block-two" * 8)
-store.commit(model, session, [h1], note="turn 1", block_size=16)
-store.commit(model, session, [h1, h2], note="turn 2")
+store.commit(model, session, [h1], note="baseline checkpoint", block_size=16)
+store.commit(model, session, [h1, h2], note="after parser fix attempt")
 PY
 
 echo "== 3. status (should be healthy, 2 turns) =="
 "$PYTHON" "$CLI" --archive-root "$ARCHIVE_A" status \
     --model-name "$MODEL" --session-id "$WS"
 
-echo "== 4. fork at t-00001 =="
+echo "== 4. fork before risky refactor =="
 "$PYTHON" "$CLI" --archive-root "$ARCHIVE_A" fork \
     --model-name "$MODEL" \
     --src-session-id "$WS" --dst-session-id "$FORK" \
-    --at-turn "t-00001" --label "demo-fork"
+    --at-turn "t-00001" --label "Refactor branch" \
+    --task-tag "coding.parser" \
+    --branch-reason "try a risky parser refactor without losing the safe checkpoint"
 
 echo "== 5. diff parent vs fork =="
 "$PYTHON" "$CLI" --archive-root "$ARCHIVE_A" diff \
@@ -85,14 +90,18 @@ echo "== 7. export workspace =="
 "$PYTHON" "$CLI" --archive-root "$ARCHIVE_A" --ssd-cache-dir "$SSD" \
     export-session --model-name "$MODEL" --session-id "$WS" --out "$BUNDLE"
 
-echo "== 8. import into second archive (with block_size guard) =="
+echo "== 8. inspect bundle provenance =="
+"$PYTHON" "$CLI" --archive-root "$ARCHIVE_A" \
+    inspect-bundle --bundle "$BUNDLE"
+
+echo "== 9. import into second archive (with block_size guard) =="
 SSD_B="$WORK/ssd-b"
 mkdir -p "$SSD_B"
 "$PYTHON" "$CLI" --archive-root "$ARCHIVE_B" --ssd-cache-dir "$SSD_B" \
     import-session --bundle "$BUNDLE" \
-    --expected-model-name "$MODEL" --expected-block-size 16
+    --expected-model-name "$MODEL" --expected-block-size 16 --fail-if-exists
 
-echo "== 9. resume in second archive =="
+echo "== 10. resume in second archive =="
 "$PYTHON" "$CLI" --archive-root "$ARCHIVE_B" --ssd-cache-dir "$SSD_B" \
     resume --model-name "$MODEL" --session-id "$WS"
 

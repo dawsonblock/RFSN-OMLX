@@ -102,6 +102,7 @@ class TurnInfo:
     committed_at: float
     block_count: int
     note: Optional[str]
+    branch_reason: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -115,6 +116,51 @@ class LineageInfo:
     parent: Optional[Tuple[str, str]]
     model_compat: ModelCompat
     turn_count: int
+    task_tag: Optional[str] = None
+
+
+# Bounded-text validation. Metadata is operator-readable, not a payload
+# channel — keep every field tight so a manifest stays a few KB even
+# after thousands of turns.
+_MAX_LABEL_LEN = 120
+_MAX_DESCRIPTION_LEN = 1024
+_MAX_NOTE_LEN = 512
+_MAX_BRANCH_REASON_LEN = 512
+_MAX_TASK_TAG_LEN = 64
+_TASK_TAG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]*$")
+
+
+def _validate_short_text(
+    field: str, value: Optional[str], *, max_len: int
+) -> Optional[str]:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise SessionArchiveError(
+            f"invalid metadata: {field} must be a string, got {type(value).__name__}"
+        )
+    if len(value) > max_len:
+        raise SessionArchiveError(
+            f"invalid metadata: {field} exceeds {max_len} characters "
+            f"(got {len(value)})"
+        )
+    if "\x00" in value:
+        raise SessionArchiveError(
+            f"invalid metadata: {field} contains a NUL byte"
+        )
+    return value
+
+
+def _validate_task_tag(value: Optional[str]) -> Optional[str]:
+    v = _validate_short_text("task_tag", value, max_len=_MAX_TASK_TAG_LEN)
+    if v is None or v == "":
+        return v
+    if not _TASK_TAG_RE.match(v):
+        raise SessionArchiveError(
+            f"invalid metadata: task_tag {v!r} must match "
+            f"[A-Za-z0-9][A-Za-z0-9._/-]*"
+        )
+    return v
 
 
 def _slug(name: str) -> str:
@@ -151,12 +197,24 @@ class SessionArchiveStore:
         description: Optional[str] = None,
         parent: Optional[Tuple[str, str]] = None,
         block_size: Optional[int] = None,
+        branch_reason: Optional[str] = None,
+        task_tag: Optional[str] = None,
     ) -> str:
         if not isinstance(block_hashes, list):
             raise TypeError("block_hashes must be a list of bytes")
         for h in block_hashes:
             if not isinstance(h, (bytes, bytearray)):
                 raise TypeError("block_hashes entries must be bytes")
+
+        label = _validate_short_text("label", label, max_len=_MAX_LABEL_LEN)
+        description = _validate_short_text(
+            "description", description, max_len=_MAX_DESCRIPTION_LEN
+        )
+        note = _validate_short_text("note", note, max_len=_MAX_NOTE_LEN)
+        branch_reason = _validate_short_text(
+            "branch_reason", branch_reason, max_len=_MAX_BRANCH_REASON_LEN
+        )
+        task_tag = _validate_task_tag(task_tag)
 
         session_dir = self._session_dir(model_name, session_id)
         session_dir.mkdir(parents=True, exist_ok=True)
@@ -176,6 +234,17 @@ class SessionArchiveStore:
                 )
                 existing_doc = None
 
+        def _new_turn(turn_id: str) -> Dict[str, Any]:
+            t: Dict[str, Any] = {
+                "turn_id": turn_id,
+                "committed_at": now,
+                "block_hashes": [bytes(h).hex() for h in block_hashes],
+                "note": note,
+            }
+            if branch_reason is not None:
+                t["branch_reason"] = branch_reason
+            return t
+
         if existing_doc is None:
             doc: Dict[str, Any] = {
                 "version": MANIFEST_VERSION,
@@ -183,6 +252,7 @@ class SessionArchiveStore:
                 "session_id": session_id,
                 "label": label,
                 "description": description,
+                "task_tag": task_tag,
                 "created_at": now,
                 "updated_at": now,
                 "head_turn_id": make_turn_id(1),
@@ -194,33 +264,21 @@ class SessionArchiveStore:
                 "model_compat": ModelCompat(
                     model_name=model_name, block_size=block_size
                 ).to_dict(),
-                "turns": [
-                    {
-                        "turn_id": make_turn_id(1),
-                        "committed_at": now,
-                        "block_hashes": [bytes(h).hex() for h in block_hashes],
-                        "note": note,
-                    }
-                ],
+                "turns": [_new_turn(make_turn_id(1))],
             }
         else:
             doc = self._upgrade_to_v2(existing_doc, session_dir)
             next_idx = len(doc["turns"]) + 1
             turn_id = make_turn_id(next_idx)
-            doc["turns"].append(
-                {
-                    "turn_id": turn_id,
-                    "committed_at": now,
-                    "block_hashes": [bytes(h).hex() for h in block_hashes],
-                    "note": note,
-                }
-            )
+            doc["turns"].append(_new_turn(turn_id))
             doc["head_turn_id"] = turn_id
             doc["updated_at"] = now
             if label is not None:
                 doc["label"] = label
             if description is not None:
                 doc["description"] = description
+            if task_tag is not None:
+                doc["task_tag"] = task_tag
             if block_size is not None and (
                 doc.get("model_compat") or {}
             ).get("block_size") is None:
@@ -242,6 +300,7 @@ class SessionArchiveStore:
         description: Optional[str] = None,
         parent: Optional[Tuple[str, str]] = None,
         block_size: Optional[int] = None,
+        task_tag: Optional[str] = None,
     ) -> None:
         """Create an empty workspace (manifest with ``turns=[]``).
 
@@ -251,6 +310,11 @@ class SessionArchiveStore:
         first :meth:`commit` appends a turn — that invariant is
         preserved so every existing caller keeps working.
         """
+        label = _validate_short_text("label", label, max_len=_MAX_LABEL_LEN)
+        description = _validate_short_text(
+            "description", description, max_len=_MAX_DESCRIPTION_LEN
+        )
+        task_tag = _validate_task_tag(task_tag)
         session_dir = self._session_dir(model_name, session_id)
         manifest = session_dir / _MANIFEST_NAME
         if manifest.exists():
@@ -266,6 +330,7 @@ class SessionArchiveStore:
             "session_id": session_id,
             "label": label,
             "description": description,
+            "task_tag": task_tag,
             "created_at": now,
             "updated_at": now,
             "head_turn_id": "",
@@ -288,12 +353,20 @@ class SessionArchiveStore:
         *,
         label: Optional[str] = None,
         description: Optional[str] = None,
+        task_tag: Optional[str] = None,
     ) -> None:
+        label = _validate_short_text("label", label, max_len=_MAX_LABEL_LEN)
+        description = _validate_short_text(
+            "description", description, max_len=_MAX_DESCRIPTION_LEN
+        )
+        task_tag = _validate_task_tag(task_tag)
         doc = self.load_raw(model_name, session_id)
         if label is not None:
             doc["label"] = label
         if description is not None:
             doc["description"] = description
+        if task_tag is not None:
+            doc["task_tag"] = task_tag
         doc["updated_at"] = time.time()
         self._atomic_write(self._session_dir(model_name, session_id), doc)
 
@@ -307,6 +380,8 @@ class SessionArchiveStore:
         dst_model_name: Optional[str] = None,
         label: Optional[str] = None,
         description: Optional[str] = None,
+        branch_reason: Optional[str] = None,
+        task_tag: Optional[str] = None,
         overwrite: bool = False,
     ) -> str:
         dst_model = dst_model_name or src_model_name
@@ -352,10 +427,20 @@ class SessionArchiveStore:
             dst_session_id,
             hashes,
             note=f"forked from {src_session_id!r} at {turn_id}",
-            label=label,
-            description=description,
+            label=(label if label is not None else src.get("label")),
+            description=(
+                description if description is not None else src.get("description")
+            ),
             parent=(src_session_id, turn_id),
             block_size=src_compat.block_size,
+            branch_reason=(
+                branch_reason or f"branch from {src_session_id!r}@{turn_id}"
+            ),
+            task_tag=(
+                task_tag
+                if task_tag is not None
+                else src.get("task_tag")
+            ),
         )
         return turn_id
 
@@ -430,6 +515,11 @@ class SessionArchiveStore:
                     committed_at=float(t.get("committed_at") or 0.0),
                     block_count=int(count),
                     note=(t.get("note") if t.get("note") is not None else None),
+                    branch_reason=(
+                        t.get("branch_reason")
+                        if t.get("branch_reason") is not None
+                        else None
+                    ),
                 )
             )
         return out
@@ -455,6 +545,7 @@ class SessionArchiveStore:
             parent=parent,
             model_compat=ModelCompat.from_dict(doc.get("model_compat")),
             turn_count=len(doc.get("turns") or []),
+            task_tag=(doc.get("task_tag") if doc.get("task_tag") is not None else None),
         )
 
     def _load_doc(self, model_name: str, session_id: str) -> Dict[str, Any]:
@@ -561,6 +652,7 @@ class SessionArchiveStore:
         if doc.get("version") == MANIFEST_VERSION:
             doc.setdefault("label", None)
             doc.setdefault("description", None)
+            doc.setdefault("task_tag", None)
             doc.setdefault("parent", None)
             doc.setdefault(
                 "model_compat",
@@ -573,6 +665,10 @@ class SessionArchiveStore:
             doc.setdefault("created_at", doc.get("updated_at") or 0.0)
             doc.setdefault("updated_at", doc.get("created_at") or 0.0)
             doc.setdefault("turns", [])
+            for turn in doc.get("turns") or []:
+                if isinstance(turn, dict):
+                    turn.setdefault("note", None)
+                    turn.setdefault("branch_reason", None)
             if not doc.get("head_turn_id") and doc["turns"]:
                 doc["head_turn_id"] = doc["turns"][-1].get(
                     "turn_id"

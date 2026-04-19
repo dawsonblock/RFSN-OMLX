@@ -33,8 +33,8 @@ This is **not**:
 
 | Term | Definition |
 | --- | --- |
-| **Workspace** | One logical agent task, identified by `(model_name, session_id)`. One workspace has one manifest file on disk. |
-| **Turn** | An immutable commit of a KV-block-hash list onto a workspace. Turns are numbered `t-00001`, `t-00002`, … and never renamed. |
+| **Workspace** | One logical agent task, identified by `(model_name, session_id)`. One workspace has one manifest file on disk and may carry compact human metadata such as `label`, `description`, and `task_tag`. |
+| **Turn** | An immutable commit of a KV-block-hash list onto a workspace. Turns are numbered `t-00001`, `t-00002`, … and never renamed. A turn may carry a short operator `note`; branch turns may also carry a `branch_reason`. |
 | **Head** | The most recent turn of a workspace; the one `load()` returns. Stored in `head_turn_id`. |
 | **Branch / Fork** | A new workspace created from a parent workspace at a specific parent turn. Records `parent = (parent_session_id, parent_turn_id)`. |
 | **Ancestry chain** | The list of `(session_id, turn_id)` pairs walked from a workspace up to a root by following `parent` links. |
@@ -58,13 +58,14 @@ Schema v2:
   "session_id": "...",
   "label": "...|null",
   "description": "...|null",
+  "task_tag": "coding.parser|nullable",
   "created_at": 1713500000.0,
   "updated_at": 1713500000.0,
   "head_turn_id": "t-00002",
   "parent": {"session_id": "...", "turn_id": "..."} | null,
   "model_compat": {"model_name": "...", "block_size": 16, "schema": "2"},
   "turns": [
-    {"turn_id": "t-00001", "committed_at": 1.0, "block_hashes": ["<hex>", ...], "note": "..."}
+    {"turn_id": "t-00001", "committed_at": 1.0, "block_hashes": ["<hex>", ...], "note": "...", "branch_reason": "...|null"}
   ]
 }
 ```
@@ -94,7 +95,13 @@ error vocabulary that was present before the reframe is preserved.
 ### 4.4 Fork refuses overwrite
 `fork` into an existing non-empty destination is refused unless
 `overwrite=True`. The new workspace records `parent =
-(src_session_id, src_turn_id)`.
+(src_session_id, src_turn_id)` and may record a compact `branch_reason`
+explaining *why* the branch was made.
+
+### 4.4a Human metadata stays bounded
+`label`, `description`, `task_tag`, `note`, and `branch_reason` are all
+optional, compact, and validated. The archive does **not** store full
+transcripts, prompts, or payload bytes.
 
 ### 4.5 Compatibility family is load-bearing
 Operators can pin it at import time with `--expected-model-name` and
@@ -121,6 +128,16 @@ whose `parent` points at a session that does not exist there.
 unreachable parent and the caller sees the dangling reference at the
 tail.
 
+### 4.9 Import conflict policy is conservative by default
+`import-session` validates compatibility and SHA-256 integrity **before**
+mutating archive state. If the destination session already exists, the
+default policy is to **fail**. Operators may explicitly choose one of:
+
+- `--fail-if-exists` — explicit no-overwrite policy (same as default),
+- `--rename-on-conflict` — deterministic rename to `<session>-imported-N`,
+- `--overwrite` — replace the existing destination only with explicit intent,
+- `--re-root-lineage` — clear the imported `parent` pointer rather than preserve external ancestry.
+
 ---
 
 ## 5. Integrity grades
@@ -146,19 +163,21 @@ line using exactly these strings.
 ## 6. Canonical operator workflow
 
 ```
-create → commit … → fork → diff → validate → export-session → import-session → resume
+create → commit … → fork before risky change → diff → validate → export-session → inspect-bundle → import-session → resume
 ```
 
-1. **create** an empty workspace (optional — `commit` also creates).
-2. **commit** appends a turn; done by the scheduler on successful
-   session requests, or by direct store calls in tests.
-3. **fork** branches at a chosen turn.
+1. **create** an empty coding workspace (optional — `commit` also creates).
+2. **commit** appends a turn; each turn can carry a short note like
+   "baseline checkpoint" or "after parser fix attempt".
+3. **fork** branches at a chosen turn and may record a human-readable
+   `branch_reason` such as "before risky refactor".
 4. **diff** compares two workspaces by turn.
 5. **validate** loads every workspace and (with `--ssd-cache-dir`)
    probes block presence.
-6. **export-session** writes a tarball bundle with SHA-256 per block.
-7. **import-session** verifies all SHAs before a single byte lands.
-8. **resume** prints the status block plus "next steps" hints.
+6. **export-session** writes a tarball bundle with SHA-256 per block and metadata-only provenance.
+7. **inspect-bundle** shows provenance (`source_label`, `task_tag`, `git_commit`, platform, compatibility family) without mutating anything.
+8. **import-session** verifies all SHAs before a single byte lands and applies the explicit conflict policy.
+9. **resume** prints the status block plus "next steps" hints.
 
 See `scripts/workspace_demo.sh` for a real end-to-end run.
 

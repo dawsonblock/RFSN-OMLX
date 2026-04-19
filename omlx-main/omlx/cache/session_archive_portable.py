@@ -39,7 +39,9 @@ import hashlib
 import json
 import logging
 import os
+import platform
 import shutil
+import subprocess
 import tarfile
 import tempfile
 import time
@@ -58,6 +60,7 @@ from .session_archive import (
 __all__ = [
     "export_session",
     "import_session",
+    "inspect_bundle",
     "BUNDLE_VERSION",
     "BundleError",
     "ExportResult",
@@ -78,6 +81,13 @@ _ENVELOPE_KEYS = (
     "block_count",
     "block_sha256",
     "source_cache_layout",
+    "source_label",
+    "source_description",
+    "task_tag",
+    "model_compat",
+    "platform",
+    "exporter_version",
+    "git_commit",
 )
 _CACHE_LAYOUT = "paged-ssd-safetensors/v1"
 
@@ -115,6 +125,10 @@ class ImportResult:
         "manifest_path",
         "blocks_written",
         "blocks_skipped",
+        "source_session_id",
+        "conflict_policy",
+        "re_rooted",
+        "provenance",
     )
 
     def __init__(
@@ -124,18 +138,28 @@ class ImportResult:
         manifest_path: Path,
         blocks_written: int,
         blocks_skipped: int,
+        *,
+        source_session_id: Optional[str] = None,
+        conflict_policy: str = "fail",
+        re_rooted: bool = False,
+        provenance: Optional[Dict[str, Any]] = None,
     ) -> None:
         self.model_name = model_name
         self.session_id = session_id
         self.manifest_path = manifest_path
         self.blocks_written = blocks_written
         self.blocks_skipped = blocks_skipped
+        self.source_session_id = source_session_id or session_id
+        self.conflict_policy = conflict_policy
+        self.re_rooted = re_rooted
+        self.provenance = provenance or {}
 
     def __repr__(self) -> str:  # pragma: no cover - debug
         return (
             f"ImportResult(model={self.model_name!r}, "
             f"session={self.session_id!r}, written={self.blocks_written}, "
-            f"skipped={self.blocks_skipped})"
+            f"skipped={self.blocks_skipped}, policy={self.conflict_policy!r}, "
+            f"re_rooted={self.re_rooted})"
         )
 
 
@@ -149,6 +173,48 @@ def _sha256_file(path: Path) -> str:
 
 def _block_file_from_layout(cache_dir: Path, hex_hash: str) -> Path:
     return cache_dir / hex_hash[0] / f"{hex_hash}.safetensors"
+
+
+def _git_commit_for(path: Path) -> Optional[str]:
+    try:
+        res = subprocess.run(
+            ["git", "-C", str(path), "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except Exception:
+        return None
+    if res.returncode == 0:
+        value = (res.stdout or "").strip()
+        return value or None
+    return None
+
+
+def inspect_bundle(bundle_path: Union[str, os.PathLike]) -> Dict[str, Any]:
+    """Read a bundle envelope + manifest metadata without mutating state."""
+    bp = Path(bundle_path)
+    if not bp.exists():
+        raise BundleError(f"bundle not found: {bp}")
+    with tempfile.TemporaryDirectory() as work_str:
+        work = Path(work_str)
+        try:
+            with tarfile.open(bp, "r") as tar:
+                _safe_extract(tar, work)
+        except (tarfile.TarError, OSError) as exc:
+            raise BundleError(f"bundle unreadable: {exc}") from exc
+        envelope_path = work / _BUNDLE_JSON
+        manifest_path = work / _MANIFEST_NAME
+        if not envelope_path.exists() or not manifest_path.exists():
+            raise BundleError(
+                f"bundle missing required files ({_BUNDLE_JSON} or {_MANIFEST_NAME})"
+            )
+        try:
+            envelope = json.loads(envelope_path.read_text(encoding="utf-8"))
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, ValueError, OSError) as exc:
+            raise BundleError(f"bundle metadata unreadable: {exc}") from exc
+    return {"envelope": envelope, "manifest": manifest}
 
 
 def export_session(
@@ -201,6 +267,7 @@ def export_session(
             f"pass allow_missing_blocks=True to produce a partial bundle"
         )
 
+    repo_root = Path(__file__).resolve().parents[2]
     envelope = {
         "bundle_version": BUNDLE_VERSION,
         "created_at": time.time(),
@@ -210,6 +277,17 @@ def export_session(
         "block_count": len(hex_hashes),
         "block_sha256": {},
         "source_cache_layout": _CACHE_LAYOUT,
+        "source_label": doc.get("label"),
+        "source_description": doc.get("description"),
+        "task_tag": doc.get("task_tag"),
+        "model_compat": doc.get("model_compat") or {},
+        "platform": {
+            "system": platform.system(),
+            "machine": platform.machine(),
+            "python": platform.python_version(),
+        },
+        "exporter_version": MANIFEST_VERSION,
+        "git_commit": _git_commit_for(repo_root),
     }
 
     with tempfile.TemporaryDirectory() as work_str:
@@ -270,6 +348,8 @@ def import_session(
     expected_model_name: Optional[str] = None,
     expected_block_size: Optional[int] = None,
     overwrite_session: bool = False,
+    rename_on_conflict: bool = False,
+    re_root_lineage: bool = False,
 ) -> ImportResult:
     """Verify and materialize a session bundle into ``store`` + SSD layout.
 
@@ -289,6 +369,11 @@ def import_session(
     """
     bp = Path(bundle_path)
     ssd_dir = Path(ssd_cache_dir)
+
+    if overwrite_session and rename_on_conflict:
+        raise BundleError(
+            "choose exactly one conflict policy: overwrite_session or rename_on_conflict"
+        )
 
     if not bp.exists():
         raise BundleError(f"bundle not found: {bp}")
@@ -357,13 +442,34 @@ def import_session(
                     f"{int(expected_block_size)!r}"
                 )
 
-        # Existing destination guard.
+        # Existing destination guard. Conservative by default:
+        # fail on conflict, unless the operator explicitly asks for
+        # overwrite or deterministic rename.
+        original_session_id = session_id
         dst_manifest = store.manifest_path(model_name, session_id)
-        if dst_manifest.exists() and not overwrite_session:
-            raise BundleError(
-                f"destination session already exists: "
-                f"{model_name!r}/{session_id!r}"
-            )
+        if dst_manifest.exists():
+            if overwrite_session:
+                pass
+            elif rename_on_conflict:
+                suffix = 1
+                while True:
+                    candidate = f"{original_session_id}-imported-{suffix}"
+                    candidate_manifest = store.manifest_path(model_name, candidate)
+                    if not candidate_manifest.exists():
+                        session_id = candidate
+                        manifest["session_id"] = candidate
+                        dst_manifest = candidate_manifest
+                        break
+                    suffix += 1
+            else:
+                raise BundleError(
+                    f"destination session already exists: {model_name!r}/{session_id!r} "
+                    f"(default policy: fail). Pass overwrite_session=True or "
+                    f"rename_on_conflict=True explicitly."
+                )
+
+        if re_root_lineage:
+            manifest["parent"] = None
 
         # Verify all block SHAs before writing anywhere.
         block_sha = envelope.get("block_sha256") or {}
@@ -412,4 +518,10 @@ def import_session(
         manifest_path=dst_manifest,
         blocks_written=blocks_written,
         blocks_skipped=blocks_skipped,
+        source_session_id=original_session_id,
+        conflict_policy=(
+            "overwrite" if overwrite_session else "rename" if session_id != original_session_id else "fail"
+        ),
+        re_rooted=bool(re_root_lineage),
+        provenance=envelope,
     )

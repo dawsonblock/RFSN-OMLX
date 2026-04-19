@@ -34,9 +34,11 @@ def test_workspace_demo_script_succeeds():
     )
     out = res.stdout
     # Verify every phase fired and the canonical final marker printed.
-    assert "== 1. create empty workspace ==" in out
-    assert "== 4. fork at t-00001 ==" in out
+    assert "== 1. create coding workspace ==" in out
+    assert "== 4. fork before risky refactor ==" in out
     assert "common_ancestor\talpha@t-00001" in out
+    assert "source_label\tFix parser regression" in out
+    assert "task_tag\tcoding.parser" in out
     assert "grade\thealthy" in out
     assert "blocks_written\t2" in out
     assert out.strip().endswith("DEMO OK")
