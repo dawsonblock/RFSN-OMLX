@@ -22,6 +22,12 @@ from pathlib import Path
 from typing import Any, Iterable, Iterator, List, Optional, Tuple
 
 from .session_archive import (
+    INTEGRITY_HEALTHY,
+    INTEGRITY_INCOMPATIBLE_MODEL,
+    INTEGRITY_INVALID_MANIFEST,
+    INTEGRITY_MISSING_BLOCKS,
+    INTEGRITY_STALE,
+    INTEGRITY_UNREADABLE,
     MANIFEST_VERSION,
     SessionArchiveError,
     SessionArchiveStore,
@@ -33,6 +39,7 @@ __all__ = [
     "PruneReport",
     "iter_sessions",
     "classify_session",
+    "integrity_grade",
     "find_invalid",
     "find_expired",
     "select_over_cap",
@@ -184,6 +191,33 @@ def _classify_archive_error(msg: str) -> str:
     if "compatibility mismatch" in lowered:
         return "compat"
     return "unreadable"
+
+
+def integrity_grade(
+    status: str,
+    *,
+    stale: bool = False,
+) -> str:
+    """Map a ``classify_session`` status to a shared integrity grade.
+
+    ``status`` is the first element of the tuple returned by
+    :func:`classify_session` (``"ok"``, ``"missing_blocks"``,
+    ``"invalid:<reason>"``). ``stale`` overrides a healthy result when
+    the caller has determined the manifest has aged past a retention
+    threshold.
+    """
+    if status == "ok":
+        return INTEGRITY_STALE if stale else INTEGRITY_HEALTHY
+    if status == "missing_blocks":
+        return INTEGRITY_MISSING_BLOCKS
+    if status.startswith("invalid:"):
+        reason = status.split(":", 1)[1]
+        if reason == "compat":
+            return INTEGRITY_INCOMPATIBLE_MODEL
+        if reason in ("malformed", "empty"):
+            return INTEGRITY_INVALID_MANIFEST
+        return INTEGRITY_UNREADABLE
+    return INTEGRITY_UNREADABLE
 
 
 def find_invalid(

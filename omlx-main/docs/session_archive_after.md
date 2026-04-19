@@ -189,3 +189,44 @@ in [tests/test_engine_turn_wiring.py](../tests/test_engine_turn_wiring.py).
 - No partial restore, no API surface change, no multimodal or hybrid
   cache work.
 - The session archive remains metadata-only, opt-in, and fail-loud.
+
+## 10. Appendix — lineage / recovery layer (schema v2)
+
+A later pass added a schema-v2 extension on top of the same
+metadata-only store: per-session `turns[]`, optional `parent` links,
+`model_compat`, and operator-only CLI verbs (`turns`, `head`,
+`lineage`, `fork`, `diff`, `replay-check`, `export-session`,
+`import-session`). A portable tarball bundle (`bundle.json` +
+`manifest.json` + `blocks/<hex>.safetensors`, SHA-256 verified) lets an
+operator move a named conversation between archive roots.
+
+**The benchmark verdict in §3/§5 does not change.** This layer does
+not touch `Scheduler.restore_session`, does not alter `add_request`
+ordering, and does not try to out-restore the paged SSD prefix cache.
+It is a **recovery and operational handle** — the ability to enumerate
+turns, branch a conversation at a known turn, verify every block
+referenced by a manifest is actually present on disk, and move a
+session between hosts by hash. It is not a latency feature and must
+not be marketed as one.
+
+Scope limits (same as §9):
+
+- Metadata-only. `PagedSSDCacheManager` is still the sole KV payload
+  authority. `export-session` / `import-session` read and write the
+  SSD-shard files by hash only; they never rewrite or recompute them.
+- Opt-in and explicit. None of the new verbs are reachable from the
+  HTTP API or the scheduler; they are operator CLI only.
+- All-or-nothing. Export refuses missing blocks unless
+  `--allow-missing-blocks` is passed (grade degrades to
+  `partially_exportable`); import rejects any block whose SHA-256 does
+  not match the bundle envelope.
+- v1 manifests are auto-upgraded on the next `commit()`. There is no
+  downgrade path and none is planned.
+
+Surface: [omlx/cache/session_archive.py](../omlx/cache/session_archive.py)
+(schema v2, `diff_sessions`, `replay_check`, `classify_integrity`,
+`INTEGRITY_*`), [omlx/cache/session_archive_portable.py](../omlx/cache/session_archive_portable.py)
+(`export_session`, `import_session`, `BundleError`),
+[omlx/cache/session_archive_retention.py](../omlx/cache/session_archive_retention.py)
+(`integrity_grade`), [scripts/session_archive_admin.py](../scripts/session_archive_admin.py)
+(CLI), [tests/test_session_archive_lineage.py](../tests/test_session_archive_lineage.py).

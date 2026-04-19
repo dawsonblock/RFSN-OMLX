@@ -48,11 +48,19 @@ from omlx.cache import session_archive_metrics as _metrics  # noqa: E402
 from omlx.cache.session_archive import (  # noqa: E402
     SessionArchiveError,
     SessionArchiveStore,
+    diff_sessions,
+    replay_check,
 )
 from omlx.cache.session_archive_retention import (  # noqa: E402
     classify_session,
+    integrity_grade,
     iter_sessions,
     prune as retention_prune,
+)
+from omlx.cache.session_archive_portable import (  # noqa: E402
+    BundleError,
+    export_session,
+    import_session,
 )
 
 
@@ -123,6 +131,7 @@ def _build_parser() -> argparse.ArgumentParser:
     pp.add_argument(
         "--older-than",
         default=None,
+        type=_parse_duration,
         help=(
             "Select manifests with mtime older than this duration. Accepts "
             "'<N><s|m|h|d>' (e.g. '7d', '30m', '3600s')."
@@ -148,6 +157,67 @@ def _build_parser() -> argparse.ArgumentParser:
     )
 
     sub.add_parser("stats", help="Print in-process session archive counters")
+
+    # ------- Phase 7: lineage / recovery subcommands -------
+    tp = sub.add_parser("turns", help="List turns for one session")
+    tp.add_argument("--model-name", required=True)
+    tp.add_argument("--session-id", required=True)
+
+    hp = sub.add_parser("head", help="Show head turn id and block count")
+    hp.add_argument("--model-name", required=True)
+    hp.add_argument("--session-id", required=True)
+
+    lp2 = sub.add_parser("lineage", help="Show lineage (label, parent, timestamps)")
+    lp2.add_argument("--model-name", required=True)
+    lp2.add_argument("--session-id", required=True)
+
+    fp = sub.add_parser("fork", help="Fork a session at a given turn (metadata-only)")
+    fp.add_argument("--model-name", required=True)
+    fp.add_argument("--src-session-id", required=True)
+    fp.add_argument("--dst-session-id", required=True)
+    fp.add_argument("--at-turn", default=None, help="Turn id to fork from (default: head)")
+    fp.add_argument("--label", default=None)
+    fp.add_argument("--description", default=None)
+    fp.add_argument("--overwrite", action="store_true")
+
+    dfp = sub.add_parser("diff", help="Diff two sessions (metadata only)")
+    dfp.add_argument("--model-a", required=True)
+    dfp.add_argument("--session-a", required=True)
+    dfp.add_argument("--model-b", required=True)
+    dfp.add_argument("--session-b", required=True)
+
+    rcp = sub.add_parser(
+        "replay-check",
+        help="Validate every block referenced by the session's head is still on SSD",
+    )
+    rcp.add_argument("--model-name", required=True)
+    rcp.add_argument("--session-id", required=True)
+    rcp.add_argument("--turn", default=None, help="Turn id (default: head)")
+
+    ep = sub.add_parser(
+        "export-session",
+        help="Export a session (manifest + SSD blocks) to a tarball bundle",
+    )
+    ep.add_argument("--model-name", required=True)
+    ep.add_argument("--session-id", required=True)
+    ep.add_argument("--out", required=True, type=Path)
+    ep.add_argument(
+        "--allow-missing-blocks",
+        action="store_true",
+        help="Produce a partial bundle instead of failing on missing blocks.",
+    )
+
+    ip = sub.add_parser(
+        "import-session",
+        help="Import a session bundle; verifies sha256 before writing anything",
+    )
+    ip.add_argument("--bundle", required=True, type=Path)
+    ip.add_argument(
+        "--expected-model-name",
+        default=None,
+        help="Reject bundle if its model_name does not match this.",
+    )
+    ip.add_argument("--overwrite-session", action="store_true")
 
     return p
 
@@ -314,9 +384,7 @@ def _cmd_prune(
     ssd_cache: Any,
     args: argparse.Namespace,
 ) -> int:
-    older_than: Optional[timedelta] = None
-    if args.older_than:
-        older_than = _parse_duration(args.older_than)
+    older_than: Optional[timedelta] = args.older_than
     report = retention_prune(
         store,
         ssd_cache,
@@ -367,6 +435,188 @@ def _cmd_stats(_args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_turns(store: SessionArchiveStore, args: argparse.Namespace) -> int:
+    try:
+        turns = store.list_turns(args.model_name, args.session_id)
+    except SessionArchiveError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    if not turns:
+        print("(no turns)")
+        return 0
+    print(f"turn_id\tcommitted_at\tblocks\tnote")
+    for t in turns:
+        note = t.note if t.note is not None else ""
+        print(f"{t.turn_id}\t{t.committed_at:.3f}\t{t.block_count}\t{note}")
+    return 0
+
+
+def _cmd_head(store: SessionArchiveStore, args: argparse.Namespace) -> int:
+    try:
+        hid, hashes = store.load_head(args.model_name, args.session_id)
+    except SessionArchiveError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    print(f"head_turn_id\t{hid}")
+    print(f"block_count\t{len(hashes)}")
+    return 0
+
+
+def _cmd_lineage(store: SessionArchiveStore, args: argparse.Namespace) -> int:
+    try:
+        lin = store.lineage(args.model_name, args.session_id)
+    except SessionArchiveError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    parent = (
+        f"{lin.parent[0]}@{lin.parent[1]}" if lin.parent is not None else "(root)"
+    )
+    print(f"session_id\t{lin.session_id}")
+    print(f"label\t{lin.label if lin.label is not None else ''}")
+    print(f"description\t{lin.description if lin.description is not None else ''}")
+    print(f"head_turn_id\t{lin.head_turn_id}")
+    print(f"parent\t{parent}")
+    print(f"turn_count\t{lin.turn_count}")
+    print(f"created_at\t{lin.created_at:.3f}")
+    print(f"updated_at\t{lin.updated_at:.3f}")
+    print(
+        f"model_compat\t{lin.model_compat.model_name} "
+        f"block_size={lin.model_compat.block_size} "
+        f"schema={lin.model_compat.schema}"
+    )
+    return 0
+
+
+def _cmd_fork(store: SessionArchiveStore, args: argparse.Namespace) -> int:
+    try:
+        src_turn = store.fork(
+            args.model_name,
+            args.src_session_id,
+            args.dst_session_id,
+            at_turn=args.at_turn,
+            label=args.label,
+            description=args.description,
+            overwrite=args.overwrite,
+        )
+    except SessionArchiveError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    print(
+        f"forked {args.src_session_id!r}@{src_turn} -> "
+        f"{args.dst_session_id!r}"
+    )
+    return 0
+
+
+def _cmd_diff(store: SessionArchiveStore, args: argparse.Namespace) -> int:
+    try:
+        d = diff_sessions(
+            store,
+            args.model_a, args.session_a,
+            args.model_b, args.session_b,
+        )
+    except SessionArchiveError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    print(f"session_a\t{d.session_a[0]}/{d.session_a[1]}\tturns={d.turn_count_a}")
+    print(f"session_b\t{d.session_b[0]}/{d.session_b[1]}\tturns={d.turn_count_b}")
+    if d.common_ancestor is not None:
+        print(f"common_ancestor\t{d.common_ancestor[0]}@{d.common_ancestor[1]}")
+    else:
+        print("common_ancestor\t(none)")
+    print(f"shared_turn_count\t{d.shared_turn_count}")
+    print("index\ta_turn\tb_turn\ta_blocks\tb_blocks\tcommon_prefix\tdiverged")
+    for i, t in enumerate(d.per_turn):
+        print(
+            f"{i}\t{t.turn_id_a or ''}\t{t.turn_id_b or ''}\t"
+            f"{t.block_count_a}\t{t.block_count_b}\t"
+            f"{t.common_prefix_blocks}\t{t.diverged}"
+        )
+    return 0 if d.shared_turn_count > 0 or d.common_ancestor is not None else 0
+
+
+def _cmd_replay_check(
+    store: SessionArchiveStore, ssd_cache: Any, args: argparse.Namespace
+) -> int:
+    if ssd_cache is None or not hasattr(ssd_cache, "has_block"):
+        print(
+            "error: replay-check needs --ssd-cache-dir and a readable paged SSD cache",
+            file=sys.stderr,
+        )
+        return 2
+    rep = replay_check(
+        store, args.model_name, args.session_id,
+        ssd_cache.has_block, turn_id=args.turn,
+    )
+    print(f"session_id\t{rep.session_id}")
+    print(f"head_turn_id\t{rep.head_turn_id}")
+    print(f"total_blocks\t{rep.total_blocks}")
+    print(f"present_blocks\t{rep.present_blocks}")
+    print(f"missing_blocks\t{len(rep.missing_blocks)}")
+    print(f"replayable\t{rep.replayable}")
+    print(f"grade\t{rep.grade}")
+    if rep.missing_blocks:
+        for h in rep.missing_blocks[:5]:
+            print(f"missing\t{h}")
+    return 0 if rep.replayable else 1
+
+
+def _cmd_export(
+    store: SessionArchiveStore, ssd_cache: Any, args: argparse.Namespace
+) -> int:
+    if not args.ssd_cache_dir:
+        print(
+            "error: export-session needs --ssd-cache-dir",
+            file=sys.stderr,
+        )
+        return 2
+    try:
+        res = export_session(
+            store,
+            args.model_name,
+            args.session_id,
+            args.ssd_cache_dir,
+            args.out,
+            allow_missing_blocks=args.allow_missing_blocks,
+        )
+    except BundleError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    print(f"path\t{res.path}")
+    print(f"block_count\t{res.block_count}")
+    print(f"missing_block_count\t{res.missing_block_count}")
+    print(f"grade\t{res.grade}")
+    return 0
+
+
+def _cmd_import(
+    store: SessionArchiveStore, args: argparse.Namespace
+) -> int:
+    if not args.ssd_cache_dir:
+        print(
+            "error: import-session needs --ssd-cache-dir",
+            file=sys.stderr,
+        )
+        return 2
+    try:
+        res = import_session(
+            store,
+            args.bundle,
+            args.ssd_cache_dir,
+            expected_model_name=args.expected_model_name,
+            overwrite_session=args.overwrite_session,
+        )
+    except BundleError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    print(f"model_name\t{res.model_name}")
+    print(f"session_id\t{res.session_id}")
+    print(f"manifest_path\t{res.manifest_path}")
+    print(f"blocks_written\t{res.blocks_written}")
+    print(f"blocks_skipped\t{res.blocks_skipped}")
+    return 0
+
+
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
@@ -396,6 +646,22 @@ def main(argv: Optional[list] = None) -> int:
         return _cmd_prune(store, ssd_cache, args)
     if args.cmd == "stats":
         return _cmd_stats(args)
+    if args.cmd == "turns":
+        return _cmd_turns(store, args)
+    if args.cmd == "head":
+        return _cmd_head(store, args)
+    if args.cmd == "lineage":
+        return _cmd_lineage(store, args)
+    if args.cmd == "fork":
+        return _cmd_fork(store, args)
+    if args.cmd == "diff":
+        return _cmd_diff(store, args)
+    if args.cmd == "replay-check":
+        return _cmd_replay_check(store, ssd_cache, args)
+    if args.cmd == "export-session":
+        return _cmd_export(store, ssd_cache, args)
+    if args.cmd == "import-session":
+        return _cmd_import(store, args)
     parser.error(f"unknown command {args.cmd!r}")
     return 2  # pragma: no cover
 

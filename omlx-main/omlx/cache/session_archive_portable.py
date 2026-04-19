@@ -1,0 +1,401 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Portable session bundle: explicit export/import of a session with payload.
+
+Status: **experimental / internal**. This is the one path that copies
+KV payload bytes on top of the normal metadata-only session archive —
+and it only runs when an operator explicitly asks for it. Bundles are
+self-describing and verified on import; they never touch the paged SSD
+cache outside of the explicit import call.
+
+On-disk format (tarball, uncompressed by default)::
+
+    <bundle>.omlx-session.tar
+    ├── bundle.json                     # envelope, see _ENVELOPE_KEYS
+    ├── manifest.json                   # the session's v2 manifest
+    └── blocks/<hex>.safetensors        # one file per referenced block
+
+``bundle.json`` records::
+
+    {
+        "bundle_version": "1",
+        "created_at": <epoch>,
+        "model_name": "...",
+        "session_id": "...",
+        "head_turn_id": "...",
+        "block_count": <int>,
+        "block_sha256": {"<hex_hash>": "<sha256 of file bytes>", ...},
+        "source_cache_layout": "paged-ssd-safetensors/v1"
+    }
+
+Import validates every ``block_sha256`` before writing into the target
+SSD layout (``<cache_dir>/<hex[0]>/<hex>.safetensors``) and calls
+``PagedSSDCacheManager._scan_existing_files`` so the manager rebuilds
+its in-memory index.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import logging
+import os
+import shutil
+import tarfile
+import tempfile
+import time
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
+
+from .session_archive import (
+    INTEGRITY_MISSING_BLOCKS,
+    INTEGRITY_PARTIALLY_EXPORTABLE,
+    MANIFEST_VERSION,
+    SessionArchiveError,
+    SessionArchiveStore,
+    _MANIFEST_NAME,
+)
+
+__all__ = [
+    "export_session",
+    "import_session",
+    "BUNDLE_VERSION",
+    "BundleError",
+    "ExportResult",
+    "ImportResult",
+]
+
+_log = logging.getLogger(__name__)
+
+BUNDLE_VERSION = "1"
+_BUNDLE_JSON = "bundle.json"
+_BLOCKS_DIR = "blocks"
+_ENVELOPE_KEYS = (
+    "bundle_version",
+    "created_at",
+    "model_name",
+    "session_id",
+    "head_turn_id",
+    "block_count",
+    "block_sha256",
+    "source_cache_layout",
+)
+_CACHE_LAYOUT = "paged-ssd-safetensors/v1"
+
+
+class BundleError(RuntimeError):
+    """Raised when a session bundle cannot be built, read, or verified."""
+
+
+class ExportResult:
+    __slots__ = ("path", "block_count", "missing_block_count", "grade")
+
+    def __init__(
+        self,
+        path: Path,
+        block_count: int,
+        missing_block_count: int,
+        grade: str,
+    ) -> None:
+        self.path = path
+        self.block_count = block_count
+        self.missing_block_count = missing_block_count
+        self.grade = grade
+
+    def __repr__(self) -> str:  # pragma: no cover - debug
+        return (
+            f"ExportResult(path={self.path!r}, blocks={self.block_count}, "
+            f"missing={self.missing_block_count}, grade={self.grade!r})"
+        )
+
+
+class ImportResult:
+    __slots__ = (
+        "model_name",
+        "session_id",
+        "manifest_path",
+        "blocks_written",
+        "blocks_skipped",
+    )
+
+    def __init__(
+        self,
+        model_name: str,
+        session_id: str,
+        manifest_path: Path,
+        blocks_written: int,
+        blocks_skipped: int,
+    ) -> None:
+        self.model_name = model_name
+        self.session_id = session_id
+        self.manifest_path = manifest_path
+        self.blocks_written = blocks_written
+        self.blocks_skipped = blocks_skipped
+
+    def __repr__(self) -> str:  # pragma: no cover - debug
+        return (
+            f"ImportResult(model={self.model_name!r}, "
+            f"session={self.session_id!r}, written={self.blocks_written}, "
+            f"skipped={self.blocks_skipped})"
+        )
+
+
+def _sha256_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _block_file_from_layout(cache_dir: Path, hex_hash: str) -> Path:
+    return cache_dir / hex_hash[0] / f"{hex_hash}.safetensors"
+
+
+def export_session(
+    store: SessionArchiveStore,
+    model_name: str,
+    session_id: str,
+    ssd_cache_dir: Union[str, os.PathLike],
+    out_path: Union[str, os.PathLike],
+    *,
+    allow_missing_blocks: bool = False,
+) -> ExportResult:
+    """Export a session manifest + referenced SSD blocks to a tarball.
+
+    Raises :class:`BundleError` when blocks are missing and
+    ``allow_missing_blocks`` is False. When True, a
+    ``partially_exportable`` bundle is produced and missing blocks are
+    omitted (their hashes are still recorded in the manifest).
+    """
+    try:
+        doc = store.load_raw(model_name, session_id)
+    except SessionArchiveError as exc:
+        raise BundleError(f"cannot export: {exc}") from exc
+
+    ssd_dir = Path(ssd_cache_dir)
+    out = Path(out_path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+
+    # Collect all referenced block hashes across all turns, deduped.
+    hex_hashes: List[str] = []
+    seen: set = set()
+    for turn in doc.get("turns") or []:
+        for hex_h in turn.get("block_hashes") or []:
+            if hex_h not in seen:
+                seen.add(hex_h)
+                hex_hashes.append(hex_h)
+
+    present_paths: List[Tuple[str, Path]] = []
+    missing: List[str] = []
+    for hex_h in hex_hashes:
+        block_file = _block_file_from_layout(ssd_dir, hex_h)
+        if block_file.exists():
+            present_paths.append((hex_h, block_file))
+        else:
+            missing.append(hex_h)
+
+    if missing and not allow_missing_blocks:
+        raise BundleError(
+            f"cannot export: {len(missing)} referenced block(s) missing from "
+            f"SSD cache {ssd_dir} (e.g. {missing[:3]}); "
+            f"pass allow_missing_blocks=True to produce a partial bundle"
+        )
+
+    envelope = {
+        "bundle_version": BUNDLE_VERSION,
+        "created_at": time.time(),
+        "model_name": model_name,
+        "session_id": session_id,
+        "head_turn_id": str(doc.get("head_turn_id") or ""),
+        "block_count": len(hex_hashes),
+        "block_sha256": {},
+        "source_cache_layout": _CACHE_LAYOUT,
+    }
+
+    with tempfile.TemporaryDirectory() as work_str:
+        work = Path(work_str)
+        blocks_tmp = work / _BLOCKS_DIR
+        blocks_tmp.mkdir()
+        for hex_h, src in present_paths:
+            digest = _sha256_file(src)
+            envelope["block_sha256"][hex_h] = digest
+            shutil.copy2(src, blocks_tmp / f"{hex_h}.safetensors")
+
+        (work / _MANIFEST_NAME).write_text(
+            json.dumps(doc, separators=(",", ":"), sort_keys=True),
+            encoding="utf-8",
+        )
+        (work / _BUNDLE_JSON).write_text(
+            json.dumps(envelope, separators=(",", ":"), sort_keys=True),
+            encoding="utf-8",
+        )
+
+        with tarfile.open(out, "w") as tar:
+            tar.add(work / _BUNDLE_JSON, arcname=_BUNDLE_JSON)
+            tar.add(work / _MANIFEST_NAME, arcname=_MANIFEST_NAME)
+            tar.add(work / _BLOCKS_DIR, arcname=_BLOCKS_DIR)
+
+    grade = INTEGRITY_PARTIALLY_EXPORTABLE if missing else "healthy"
+    return ExportResult(
+        path=out,
+        block_count=len(present_paths),
+        missing_block_count=len(missing),
+        grade=grade,
+    )
+
+
+def _safe_extract(tar: tarfile.TarFile, dst: Path) -> None:
+    dst_resolved = dst.resolve()
+    for member in tar.getmembers():
+        member_path = (dst / member.name).resolve()
+        try:
+            member_path.relative_to(dst_resolved)
+        except ValueError:
+            raise BundleError(
+                f"bundle contains unsafe path {member.name!r} (path traversal)"
+            )
+        # Reject symlinks / devices — blocks and manifest are plain files.
+        if member.issym() or member.islnk() or member.isdev():
+            raise BundleError(
+                f"bundle contains disallowed entry type for {member.name!r}"
+            )
+    tar.extractall(dst)
+
+
+def import_session(
+    store: SessionArchiveStore,
+    bundle_path: Union[str, os.PathLike],
+    ssd_cache_dir: Union[str, os.PathLike],
+    *,
+    expected_model_name: Optional[str] = None,
+    overwrite_session: bool = False,
+) -> ImportResult:
+    """Verify and materialize a session bundle into ``store`` + SSD layout.
+
+    Validates:
+      * envelope ``bundle_version``
+      * SHA-256 for every block file vs. ``block_sha256``
+      * ``model_name`` matches ``expected_model_name`` if provided
+      * destination session does not already exist unless
+        ``overwrite_session`` is True
+
+    Does NOT start or touch a running ``PagedSSDCacheManager``. Callers
+    that need the in-memory index refreshed should call the manager's
+    ``_scan_existing_files`` (or restart the process) after import.
+    """
+    bp = Path(bundle_path)
+    ssd_dir = Path(ssd_cache_dir)
+
+    if not bp.exists():
+        raise BundleError(f"bundle not found: {bp}")
+
+    with tempfile.TemporaryDirectory() as work_str:
+        work = Path(work_str)
+        try:
+            with tarfile.open(bp, "r") as tar:
+                _safe_extract(tar, work)
+        except (tarfile.TarError, OSError) as exc:
+            raise BundleError(f"bundle unreadable: {exc}") from exc
+
+        envelope_path = work / _BUNDLE_JSON
+        manifest_path = work / _MANIFEST_NAME
+        if not envelope_path.exists() or not manifest_path.exists():
+            raise BundleError(
+                f"bundle missing required files ({_BUNDLE_JSON} or "
+                f"{_MANIFEST_NAME})"
+            )
+
+        try:
+            envelope = json.loads(envelope_path.read_text(encoding="utf-8"))
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, ValueError, OSError) as exc:
+            raise BundleError(
+                f"bundle metadata unreadable: {exc}"
+            ) from exc
+
+        for key in _ENVELOPE_KEYS:
+            if key not in envelope:
+                raise BundleError(
+                    f"bundle envelope missing required key {key!r}"
+                )
+        if envelope["bundle_version"] != BUNDLE_VERSION:
+            raise BundleError(
+                f"bundle version mismatch: got "
+                f"{envelope['bundle_version']!r}, expected "
+                f"{BUNDLE_VERSION!r}"
+            )
+        if manifest.get("version") != MANIFEST_VERSION:
+            raise BundleError(
+                f"bundled manifest must be schema v{MANIFEST_VERSION} "
+                f"(got {manifest.get('version')!r})"
+            )
+
+        model_name = str(envelope["model_name"])
+        session_id = str(envelope["session_id"])
+        if expected_model_name and model_name != expected_model_name:
+            raise BundleError(
+                f"bundle model_name={model_name!r} does not match expected "
+                f"{expected_model_name!r}"
+            )
+        if manifest.get("model_name") != model_name:
+            raise BundleError(
+                f"bundle envelope/manifest model_name mismatch: "
+                f"{model_name!r} vs {manifest.get('model_name')!r}"
+            )
+
+        # Existing destination guard.
+        dst_manifest = store.manifest_path(model_name, session_id)
+        if dst_manifest.exists() and not overwrite_session:
+            raise BundleError(
+                f"destination session already exists: "
+                f"{model_name!r}/{session_id!r}"
+            )
+
+        # Verify all block SHAs before writing anywhere.
+        block_sha = envelope.get("block_sha256") or {}
+        if not isinstance(block_sha, dict):
+            raise BundleError("bundle envelope block_sha256 is not an object")
+        blocks_src = work / _BLOCKS_DIR
+        verified: List[Tuple[str, Path]] = []
+        for hex_h, expected_sha in block_sha.items():
+            src = blocks_src / f"{hex_h}.safetensors"
+            if not src.exists():
+                raise BundleError(
+                    f"bundle missing block file for hash {hex_h}"
+                )
+            actual = _sha256_file(src)
+            if actual != expected_sha:
+                raise BundleError(
+                    f"block {hex_h} sha256 mismatch: expected "
+                    f"{expected_sha!r}, got {actual!r}"
+                )
+            verified.append((hex_h, src))
+
+        # Everything checks out — install.
+        ssd_dir.mkdir(parents=True, exist_ok=True)
+        blocks_written = 0
+        blocks_skipped = 0
+        for hex_h, src in verified:
+            dst_file = _block_file_from_layout(ssd_dir, hex_h)
+            dst_file.parent.mkdir(parents=True, exist_ok=True)
+            if dst_file.exists():
+                blocks_skipped += 1
+                continue
+            # Atomic-ish: copy to temp in same dir then rename.
+            tmp = dst_file.parent / f".{hex_h}.import.tmp"
+            shutil.copy2(src, tmp)
+            os.replace(tmp, dst_file)
+            blocks_written += 1
+
+        # Install the manifest via the store (atomic write).
+        session_dir = store._session_dir(model_name, session_id)  # noqa: SLF001
+        session_dir.mkdir(parents=True, exist_ok=True)
+        store._atomic_write(session_dir, manifest)  # noqa: SLF001
+
+    return ImportResult(
+        model_name=model_name,
+        session_id=session_id,
+        manifest_path=dst_manifest,
+        blocks_written=blocks_written,
+        blocks_skipped=blocks_skipped,
+    )
