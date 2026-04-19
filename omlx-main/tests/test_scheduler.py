@@ -1898,3 +1898,57 @@ class TestExecutorBoundaryOwnership:
         assert snap["executor_boundary_mode"] == "owned"
         assert snap["executor_steps"] >= 1
         assert snap["executor_finish_overrides"] >= 1
+
+    def test_owned_executor_boundary_skips_stock_step_for_local_abort(
+        self, mock_model, mock_tokenizer
+    ):
+        """If the branch can finalize locally, stock decode should not run."""
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        scheduler.runtime_metrics.enabled = True
+        scheduler._get_detokenizer = MagicMock(return_value=None)
+
+        req = self._make_running_request(max_tokens=4)
+        scheduler.running[req.request_id] = req
+        scheduler.requests[req.request_id] = req
+        scheduler.request_id_to_uid[req.request_id] = req.batch_uid
+        scheduler.uid_to_request_id[req.batch_uid] = req.request_id
+        scheduler._pending_abort_ids.add(req.request_id)
+        scheduler._process_pending_aborts = MagicMock()
+
+        scheduler.batch_generator = MagicMock()
+        scheduler.batch_generator.next_generated.side_effect = AssertionError(
+            "stock decode should not run"
+        )
+
+        out = scheduler.step()
+
+        assert req.request_id in out.finished_request_ids
+        assert out.outputs == []
+        assert req.request_id not in scheduler.running
+
+    def test_owned_executor_boundary_skips_stock_step_for_local_length_cap(
+        self, mock_model, mock_tokenizer
+    ):
+        """Requests already at max_tokens should finish before stock decode."""
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        scheduler.runtime_metrics.enabled = True
+        scheduler._get_detokenizer = MagicMock(return_value=None)
+
+        req = self._make_running_request(max_tokens=1)
+        req.output_token_ids = [99]
+        req.num_computed_tokens = 1
+        scheduler.running[req.request_id] = req
+        scheduler.requests[req.request_id] = req
+        scheduler.request_id_to_uid[req.request_id] = req.batch_uid
+        scheduler.uid_to_request_id[req.batch_uid] = req.request_id
+
+        scheduler.batch_generator = MagicMock()
+        scheduler.batch_generator.next_generated.side_effect = AssertionError(
+            "stock decode should not run"
+        )
+
+        out = scheduler.step()
+
+        assert req.request_id in out.finished_request_ids
+        assert out.outputs == []
+        assert req.request_id not in scheduler.running

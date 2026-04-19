@@ -22,6 +22,7 @@ The lower-level generator remains delegated for now, but the scheduler is the au
 
 After this lands, the branch owns:
 - the default decode-step boundary in the scheduler step loop
+- pre-step pruning of cancelled or locally complete requests before stock decode
 - branch-side finish normalization
 - branch-side cancellation suppression before emission
 - branch-side executor-seam counters and runtime proof data

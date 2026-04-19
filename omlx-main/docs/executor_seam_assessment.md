@@ -15,6 +15,7 @@ That meant the branch owned admission, queueing, and prefill orchestration, but 
 
 After this pass, the branch owns one real seam:
 - decode-step entry and gating,
+- pre-step pruning of locally ineligible work,
 - cancellation suppression before emission,
 - local finish normalization against request budget,
 - and executor-boundary accounting for proof and audit.
@@ -101,6 +102,7 @@ That is why this is a real ownership gain without pretending the entire runtime 
 
 This seam counts as real ownership because:
 - the default scheduler path now passes through branch code before a decode response can advance request state,
+- the branch can finalize some cancelled or locally complete requests without entering stock decode at all,
 - the branch can suppress cancellation locally before emission,
 - the branch can locally normalize finish state when the request budget is exhausted,
 - and targeted tests plus stock-versus-owned benchmarks verify that this path is exercised.

@@ -10,6 +10,7 @@
 - prompt size: about 1200 tokens
 - decode budget: 12 tokens
 - repetitions: 2
+- same model, prompt budget, and decode budget on both paths
 
 ---
 
@@ -29,24 +30,24 @@ The lower-level MLX executor still performs the actual forward pass and token sa
 
 | Scenario | Path | TTFT ms | Prefill ms | Decode ms | Total ms |
 | --- | --- | ---: | ---: | ---: | ---: |
-| cold | stock | 632.63 | 404.91 | 271.80 | 677.60 |
-| cold | owned | 423.18 | 224.93 | 239.44 | 468.98 |
-| restart_cache | stock | 397.59 | 101.22 | 350.63 | 454.16 |
-| restart_cache | owned | 376.64 | 112.51 | 329.14 | 432.73 |
-| restart_restore | stock | 346.70 | 71.24 | 324.81 | 402.06 |
-| restart_restore | owned | 334.72 | 65.55 | 337.20 | 409.06 |
+| cold | stock | 675.05 | 453.62 | 270.91 | 725.24 |
+| cold | owned | 394.96 | 210.86 | 230.74 | 444.84 |
+| restart_cache | stock | 276.73 | 64.01 | 261.23 | 331.11 |
+| restart_cache | owned | 259.10 | 63.59 | 244.38 | 312.37 |
+| restart_restore | stock | 259.99 | 62.87 | 244.20 | 313.30 |
+| restart_restore | owned | 272.15 | 60.07 | 259.68 | 324.05 |
 
 ### Interpretation
-- cold and restart-cache were slightly better in the owned seam run
-- restart-restore was roughly neutral, with the owned seam slightly higher total latency
+- cold and restart-cache were lower on the owned seam in this repeated run
+- restart-restore stayed close to neutral, with the owned seam slightly higher total latency
 - the sample size is still modest, so this supports authority and non-regression, not a broad speed claim
 
 ---
 
 ## Correctness and non-regression
 
-Fresh verification evidence after the seam landed:
-- 169 tests passed in 23.08s
+Fresh verification evidence after the stronger seam landed:
+- 171 tests passed in 23.86s
 
 This covered scheduler behavior, runtime metrics, workspace lineage, and archive hardening flows.
 

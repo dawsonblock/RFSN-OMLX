@@ -3840,20 +3840,11 @@ class Scheduler:
             )
             return outcome
 
-        raw_responses = self.batch_generator.next_generated() or []
         removed_uids: List[int] = []
+        eligible_request_ids: List[str] = []
 
-        for response in raw_responses:
-            request_id = self.uid_to_request_id.get(getattr(response, "uid", None))
-            if request_id is None:
-                outcome.suppressed_request_ids.add(f"uid:{getattr(response, 'uid', None)}")
-                continue
-
-            request = self.running.get(request_id)
-            if request is None:
-                outcome.suppressed_request_ids.add(request_id)
-                continue
-
+        for request_id, request in list(self.running.items()):
+            uid = self.request_id_to_uid.get(request_id)
             if request_id in self._pending_abort_ids:
                 request.set_finished(RequestStatus.FINISHED_ABORTED)
                 self.runtime_metrics.mark_finished(
@@ -3864,9 +3855,53 @@ class Scheduler:
                 self._pending_abort_ids.discard(request_id)
                 outcome.finished_request_ids.add(request_id)
                 outcome.suppressed_request_ids.add(request_id)
-                uid = self.request_id_to_uid.get(request_id)
                 if uid is not None:
                     removed_uids.append(uid)
+                continue
+
+            max_tokens = int(getattr(request.sampling_params, "max_tokens", 0) or 0)
+            if max_tokens > 0 and request.num_output_tokens >= max_tokens:
+                request.set_finished(RequestStatus.FINISHED_LENGTH_CAPPED)
+                self.runtime_metrics.mark_finished(
+                    request_id,
+                    finish_reason="length",
+                    completion_tokens=request.num_output_tokens,
+                )
+                outcome.finished_request_ids.add(request_id)
+                outcome.suppressed_request_ids.add(request_id)
+                outcome.finish_overrides += 1
+                if uid is not None:
+                    removed_uids.append(uid)
+                continue
+
+            eligible_request_ids.append(request_id)
+
+        if removed_uids and self.batch_generator is not None:
+            try:
+                self.batch_generator.remove(removed_uids)
+            except Exception:
+                logger.debug("Executor boundary could not remove aborted UIDs", exc_info=True)
+
+        if not eligible_request_ids:
+            self.runtime_metrics.mark_executor_step(
+                mode=self._executor_boundary_mode,
+                response_count=0,
+                suppressed_count=len(outcome.suppressed_request_ids),
+                finish_overrides=outcome.finish_overrides,
+            )
+            return outcome
+
+        raw_responses = self.batch_generator.next_generated() or []
+
+        for response in raw_responses:
+            request_id = self.uid_to_request_id.get(getattr(response, "uid", None))
+            if request_id is None:
+                outcome.suppressed_request_ids.add(f"uid:{getattr(response, 'uid', None)}")
+                continue
+
+            request = self.running.get(request_id)
+            if request is None or request_id in outcome.finished_request_ids:
+                outcome.suppressed_request_ids.add(request_id)
                 continue
 
             finish_reason = getattr(response, "finish_reason", None)
