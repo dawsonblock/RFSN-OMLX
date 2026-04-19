@@ -229,6 +229,10 @@ Conflict policy is explicit and conservative:
 - **`--overwrite`**: replace only with explicit operator intent,
 - **`--re-root-lineage`**: clear the imported `parent` link instead of preserving an external ancestor.
 
+The store also rejects identity ambiguity: a manifest or bundle whose
+recorded `session_id` does not exactly match the requested/imported
+workspace is treated as invalid rather than aliased.
+
 Uncompressed tarball, `BUNDLE_VERSION = "1"`:
 
 ```

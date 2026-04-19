@@ -228,6 +228,16 @@ def inspect_bundle(bundle_path: Union[str, os.PathLike]) -> Dict[str, Any]:
         raise BundleError(
             f"bundled manifest must be schema v{MANIFEST_VERSION} (got {manifest.get('version')!r})"
         )
+    if manifest.get("session_id") != envelope.get("session_id"):
+        raise BundleError(
+            f"bundle envelope/manifest session_id mismatch: "
+            f"{envelope.get('session_id')!r} vs {manifest.get('session_id')!r}"
+        )
+    if manifest.get("head_turn_id") != envelope.get("head_turn_id"):
+        raise BundleError(
+            f"bundle envelope/manifest head_turn_id mismatch: "
+            f"{envelope.get('head_turn_id')!r} vs {manifest.get('head_turn_id')!r}"
+        )
     return {"envelope": envelope, "manifest": manifest}
 
 
@@ -455,6 +465,16 @@ def import_session(
                 f"bundle envelope/manifest model_name mismatch: "
                 f"{model_name!r} vs {manifest.get('model_name')!r}"
             )
+        if manifest.get("session_id") != session_id:
+            raise BundleError(
+                f"bundle envelope/manifest session_id mismatch: "
+                f"{session_id!r} vs {manifest.get('session_id')!r}"
+            )
+        if manifest.get("head_turn_id") != envelope.get("head_turn_id"):
+            raise BundleError(
+                f"bundle envelope/manifest head_turn_id mismatch: "
+                f"{envelope.get('head_turn_id')!r} vs {manifest.get('head_turn_id')!r}"
+            )
 
         env_compat = envelope.get("model_compat") or {}
         if env_compat:
@@ -505,6 +525,14 @@ def import_session(
 
         if re_root_lineage:
             manifest["parent"] = None
+
+        # Validate the bundled manifest structure after any deterministic
+        # import-time rewrite (rename / re-root) but before writing bytes.
+        manifest["session_id"] = session_id
+        try:
+            store._validate_v2_doc(model_name, session_id, manifest)  # noqa: SLF001
+        except SessionArchiveError as exc:
+            raise BundleError(f"bundled manifest invalid: {exc}") from exc
 
         # Verify all block SHAs before writing anywhere.
         block_sha = envelope.get("block_sha256") or {}

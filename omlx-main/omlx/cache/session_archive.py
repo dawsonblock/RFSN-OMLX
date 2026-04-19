@@ -591,6 +591,17 @@ class SessionArchiveStore:
                 f"caller asked for model_name={model_name!r} "
                 f"(supported versions={SUPPORTED_MANIFEST_VERSIONS})"
             )
+        stored_session = doc.get("session_id")
+        if not isinstance(stored_session, str):
+            raise SessionArchiveError(
+                f"malformed manifest: {manifest} is missing a string session_id"
+            )
+        if stored_session != session_id:
+            raise SessionArchiveError(
+                f"malformed manifest: session_id mismatch at {manifest}: "
+                f"stored session_id={stored_session!r}, caller asked for "
+                f"session_id={session_id!r} (possible slug collision or copied directory)"
+            )
         return doc
 
     def _head_hashes(

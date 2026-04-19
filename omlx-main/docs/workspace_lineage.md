@@ -101,6 +101,10 @@ error vocabulary that was present before the reframe is preserved.
 (src_session_id, src_turn_id)` and may record a compact `branch_reason`
 explaining *why* the branch was made.
 
+Workspace identity is exact. If two raw `session_id` values would map to
+the same on-disk slug, the store refuses the alias rather than silently
+merging or overwriting lineage.
+
 ### 4.4a Human metadata stays bounded
 `label`, `description`, `task_tag`, `note`, and `branch_reason` are all
 optional, compact, and validated. The archive does **not** store full

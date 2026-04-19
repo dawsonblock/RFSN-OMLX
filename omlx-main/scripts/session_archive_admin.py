@@ -349,8 +349,26 @@ def _parse_duration(text: str) -> timedelta:
     return timedelta(seconds=seconds)
 
 
+class _ReadOnlySSDProbe:
+    """Minimal read-only SSD probe for operator validation commands."""
+
+    def __init__(self, cache_dir: Path) -> None:
+        self._cache_dir = Path(cache_dir)
+
+    def has_block(self, block_hash: Any) -> bool:
+        if isinstance(block_hash, (bytes, bytearray)):
+            hex_h = bytes(block_hash).hex()
+        elif isinstance(block_hash, str):
+            hex_h = block_hash.strip().lower()
+        else:
+            return False
+        if not hex_h:
+            return False
+        return (self._cache_dir / hex_h[0] / f"{hex_h}.safetensors").exists()
+
+
 def _open_ssd_cache(ssd_dir: Optional[Path]) -> Any:
-    """Return a read-only-ish SSD cache handle, or None."""
+    """Return a strictly read-only SSD presence probe, or None."""
     if ssd_dir is None:
         return None
     if not ssd_dir.exists():
@@ -360,33 +378,10 @@ def _open_ssd_cache(ssd_dir: Optional[Path]) -> Any:
             file=sys.stderr,
         )
         return None
-    try:
-        from omlx.cache.paged_ssd_cache import PagedSSDCacheManager
-    except Exception as exc:  # pragma: no cover — import guard
-        print(
-            f"warning: cannot import PagedSSDCacheManager ({exc}); "
-            "skipping block-presence checks",
-            file=sys.stderr,
-        )
-        return None
-    try:
-        return PagedSSDCacheManager(cache_dir=ssd_dir)
-    except TypeError:
-        # Older signatures.
-        try:
-            return PagedSSDCacheManager(str(ssd_dir))
-        except Exception as exc:
-            print(
-                f"warning: cannot open PagedSSDCacheManager({ssd_dir}): {exc}",
-                file=sys.stderr,
-            )
-            return None
-    except Exception as exc:
-        print(
-            f"warning: cannot open PagedSSDCacheManager({ssd_dir}): {exc}",
-            file=sys.stderr,
-        )
-        return None
+    # Operator status/validate/resume only need block presence by hash.
+    # Do not instantiate the live PagedSSDCacheManager here: that can
+    # scan, quarantine, or otherwise mutate unrelated cache state.
+    return _ReadOnlySSDProbe(ssd_dir)
 
 
 def _fmt_mtime(mtime: float) -> str:

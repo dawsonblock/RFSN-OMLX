@@ -95,6 +95,15 @@ def test_invalid_metadata_rejected_cleanly(tmp_path):
         store.init_workspace("m", "ws-2", label="x" * 121)
 
 
+def test_session_id_slug_collision_is_rejected(tmp_path):
+    store = SessionArchiveStore(tmp_path / "archive")
+    store.commit("m", "ws/a", [_h("a")])
+    with pytest.raises(SessionArchiveError, match="session_id mismatch|already exists|collision"):
+        store.load_raw("m", "ws_a")
+    with pytest.raises(SessionArchiveError, match="session_id mismatch|collision"):
+        store.commit("m", "ws_a", [_h("b")])
+
+
 # ---------------------------------------------------------------------------
 # ancestry_chain
 # ---------------------------------------------------------------------------
@@ -217,6 +226,31 @@ def test_cli_status_reports_fields_and_grade(tmp_path):
     assert "replayable\tnot_checked" in out
     assert "can_export\tTrue" in out
     assert "grade\thealthy" in out
+
+
+def test_cli_status_with_ssd_cache_reports_replayable(tmp_path):
+    root = tmp_path / "archive"
+    ssd = tmp_path / "ssd"
+    ssd.mkdir()
+    store = SessionArchiveStore(root)
+    payload = b"replayable-payload"
+    h = hashlib.sha256(payload).digest()
+    hp = ssd / h.hex()[0] / f"{h.hex()}.safetensors"
+    hp.parent.mkdir(parents=True, exist_ok=True)
+    hp.write_bytes(payload)
+    store.commit("m", "ws-1", [h], label="Replay me")
+
+    res = _run(
+        "--archive-root", str(root),
+        "--ssd-cache-dir", str(ssd),
+        "status",
+        "--model-name", "m",
+        "--session-id", "ws-1",
+    )
+    assert res.returncode == 0, res.stderr
+    assert "replayable\tTrue" in res.stdout
+    assert "referenced_blocks_resolvable\tTrue" in res.stdout
+    assert "warning:" not in res.stderr.lower()
 
 
 def test_cli_status_empty_workspace(tmp_path):
@@ -601,6 +635,44 @@ def test_normal_workspace_ops_stay_metadata_only(tmp_path):
     _run("--archive-root", str(root), "diff", "--model-a", "m", "--session-a", "alpha", "--model-b", "m", "--session-b", "beta")
     assert list(root.rglob("*.safetensors")) == []
     assert list(root.rglob("*.tar")) == []
+
+
+def test_import_rejects_bundle_session_identity_mismatch(tmp_path):
+    import tarfile
+
+    from omlx.cache.session_archive_portable import BundleError, export_session, import_session, inspect_bundle
+
+    src_archive = tmp_path / "src"
+    ssd = tmp_path / "ssd"
+    ssd.mkdir()
+    store = SessionArchiveStore(src_archive)
+    payload = b"payload-identity"
+    h = hashlib.sha256(payload).digest()
+    hp = ssd / h.hex()[0] / f"{h.hex()}.safetensors"
+    hp.parent.mkdir(parents=True, exist_ok=True)
+    hp.write_bytes(payload)
+    store.commit("m", "ws-1", [h])
+    bundle = tmp_path / "bundle.tar"
+    export_session(store, "m", "ws-1", ssd, bundle)
+
+    work = tmp_path / "rewrite-id"
+    work.mkdir()
+    with tarfile.open(bundle, "r") as tar:
+        tar.extractall(work)
+    manifest_json = work / "manifest.json"
+    manifest = json.loads(manifest_json.read_text("utf-8"))
+    manifest["session_id"] = "other-session"
+    manifest_json.write_text(json.dumps(manifest), encoding="utf-8")
+    broken = tmp_path / "broken-id.tar"
+    with tarfile.open(broken, "w") as tar:
+        tar.add(work / "bundle.json", arcname="bundle.json")
+        tar.add(work / "manifest.json", arcname="manifest.json")
+        tar.add(work / "blocks", arcname="blocks")
+
+    with pytest.raises(BundleError, match="session_id mismatch"):
+        inspect_bundle(broken)
+    with pytest.raises(BundleError, match="session_id mismatch"):
+        import_session(SessionArchiveStore(tmp_path / "dst"), broken, tmp_path / "dst_ssd")
 
 
 def test_import_rejects_unknown_bundle_layout(tmp_path):
