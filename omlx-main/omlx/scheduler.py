@@ -37,6 +37,7 @@ from pathlib import Path
 from .cache.paged_cache import PagedCacheManager
 from .cache.prefix_cache import BlockAwarePrefixCache
 from .request import Request, RequestOutput, RequestStatus, SamplingParams
+from .runtime_metrics import RuntimeMetricsRecorder
 from .exceptions import is_cache_corruption_error
 
 
@@ -478,6 +479,7 @@ class Scheduler:
         self.running: Dict[str, Request] = {}  # Running requests by ID
         self.requests: Dict[str, Request] = {}  # All requests by ID
         self.finished_req_ids: Set[str] = set()  # Recently finished
+        self.runtime_metrics = RuntimeMetricsRecorder()
 
         # Thread-safe set for deferred aborts (main thread → executor thread)
         # CPython GIL guarantees set.add() and `x in set` are atomic.
@@ -1149,10 +1151,12 @@ class Scheduler:
             _PrefillAbortedError: If prefill is interrupted by a pending abort.
             RuntimeError: If memory limit exceeded during prefill.
         """
+        self.runtime_metrics.mark_prefill_start(request.request_id)
         n_tokens = len(tokens)
         if n_tokens <= 1:
             # Nothing to prefill, return cache + tokens as-is
             cache = existing_cache or make_prompt_cache(self.model)
+            self.runtime_metrics.mark_prefill_end(request.request_id)
             # NOTE: Do NOT apply TurboQuant here. TurboQuantKVCache does not
             # support merge(), which is called by _merge_caches() inside
             # BatchGenerator when insert() creates a PromptProcessingBatch.
@@ -1345,6 +1349,7 @@ class Scheduler:
         if vlm_embeds is not None and _saved_rope_deltas is not None:
             self.model._language_model._rope_deltas = _saved_rope_deltas
 
+        self.runtime_metrics.mark_prefill_end(request.request_id)
         return prompt_cache, last_token
 
     def _build_state_machine(self, request: "Request") -> SequenceStateMachine:
@@ -2316,6 +2321,12 @@ class Scheduler:
                 request.prompt_token_ids = list(request.prompt)
             request.num_prompt_tokens = len(request.prompt_token_ids)
 
+        self.runtime_metrics.admit_request(
+            request.request_id,
+            prompt_tokens=request.num_prompt_tokens,
+            restore_requested=bool(getattr(request, "restore", False)),
+        )
+
         # Session restore: explicit, opt-in. When set, rebuild the block
         # table from the session manifest *before* the ordinary prefix
         # cache path runs. restore_session raises loudly on unknown /
@@ -2423,6 +2434,16 @@ class Scheduler:
         # SpecPrefill: score remaining tokens with draft model if applicable.
         # Must run AFTER prefix cache check (scoring applies only to uncached suffix).
         self._try_specprefill_scoring(request)
+
+        resident_blocks = 0
+        if getattr(request, "block_table", None) is not None:
+            resident_blocks = len(list(getattr(request.block_table, "block_ids", []) or []))
+        self.runtime_metrics.note_cache_state(
+            request.request_id,
+            cached_tokens=request.cached_tokens,
+            shared_prefix_blocks=request.shared_prefix_blocks,
+            resident_blocks=resident_blocks,
+        )
 
         # Add to tracking
         self.requests[request.request_id] = request
@@ -3342,6 +3363,12 @@ class Scheduler:
                 response.logprobs = None
 
             # Create output
+            self.runtime_metrics.mark_token(
+                request_id,
+                completion_tokens=request.num_output_tokens,
+                batch_size=len(self.running),
+            )
+
             output = RequestOutput(
                 request_id=request_id,
                 new_token_ids=[response.token] if not is_stop else [],
@@ -3425,6 +3452,12 @@ class Scheduler:
 
                 self.total_completion_tokens += request.num_output_tokens
                 self.num_requests_processed += 1
+
+                self.runtime_metrics.mark_finished(
+                    request_id,
+                    finish_reason=response.finish_reason,
+                    completion_tokens=request.num_output_tokens,
+                )
 
                 logger.debug(
                     f"Request {request_id} finished: {response.finish_reason}, "
@@ -3780,6 +3813,7 @@ class Scheduler:
             # Use next_generated() which returns only GenerationBatch.Response
             # objects (prefill is handled externally before insert).
             if self.batch_generator is not None and self.running:
+                self.runtime_metrics.mark_batch(len(self.running))
                 responses = self.batch_generator.next_generated()
                 output.has_work = True
 
@@ -3894,10 +3928,23 @@ class Scheduler:
         return stats
 
     def get_cache_stats(self) -> Optional[Dict[str, Any]]:
-        """Get cache statistics."""
+        """Get cache statistics as a JSON-safe dictionary."""
         if self.block_aware_cache is not None:
-            return self.block_aware_cache.get_stats()
+            return self.block_aware_cache.get_stats_dict()
         return None
+
+    def get_runtime_metrics_snapshot(self) -> Dict[str, Any]:
+        """Get the current runtime lifecycle snapshot for benchmarks and audits."""
+        cache_stats = self.get_cache_stats() or {}
+        ssd_stats = self.get_ssd_cache_stats() or {}
+        return self.runtime_metrics.snapshot(
+            cache_stats=cache_stats,
+            ssd_stats=ssd_stats,
+        )
+
+    def reset_runtime_metrics(self) -> None:
+        """Clear accumulated runtime lifecycle observations."""
+        self.runtime_metrics.reset()
 
     def reset(self) -> None:
         """Reset the scheduler state."""
@@ -4354,10 +4401,17 @@ class Scheduler:
         from .cache.session_archive import SessionArchiveError
 
         _sa_metrics.bump(_sa_metrics.EVENT_RESTORE_ATTEMPTED)
+        restore_started = time.perf_counter()
 
         session_id = getattr(request, "session_id", None)
         if not session_id:
             _sa_metrics.bump(_sa_metrics.EVENT_RESTORE_REJECTED, reason="no_session_id")
+            self.runtime_metrics.mark_restore(
+                request.request_id,
+                succeeded=False,
+                duration_ms=(time.perf_counter() - restore_started) * 1000.0,
+                reason="no_session_id",
+            )
             raise ValueError(
                 "restore_session requires request.session_id; refusing to "
                 "restore an unnamed session"
@@ -4366,6 +4420,12 @@ class Scheduler:
         store = getattr(self, "session_archive_store", None)
         if store is None:
             _sa_metrics.bump(_sa_metrics.EVENT_RESTORE_REJECTED, reason="no_store")
+            self.runtime_metrics.mark_restore(
+                request.request_id,
+                succeeded=False,
+                duration_ms=(time.perf_counter() - restore_started) * 1000.0,
+                reason="no_store",
+            )
             raise RuntimeError(
                 "restore_session called but scheduler has no "
                 "session_archive_store configured"
@@ -4374,6 +4434,12 @@ class Scheduler:
         ssd = getattr(self, "paged_ssd_cache_manager", None)
         if ssd is None:
             _sa_metrics.bump(_sa_metrics.EVENT_RESTORE_REJECTED, reason="no_ssd")
+            self.runtime_metrics.mark_restore(
+                request.request_id,
+                succeeded=False,
+                duration_ms=(time.perf_counter() - restore_started) * 1000.0,
+                reason="no_ssd",
+            )
             raise RuntimeError(
                 "restore_session called but scheduler has no "
                 "paged_ssd_cache_manager configured"
@@ -4386,6 +4452,12 @@ class Scheduler:
         except SessionArchiveError as exc:
             reason = _classify_restore_error(str(exc))
             _sa_metrics.bump(_sa_metrics.EVENT_RESTORE_REJECTED, reason=reason)
+            self.runtime_metrics.mark_restore(
+                request.request_id,
+                succeeded=False,
+                duration_ms=(time.perf_counter() - restore_started) * 1000.0,
+                reason=reason,
+            )
             raise
 
         # Every referenced block must be present in the SSD cache. A gap
@@ -4397,6 +4469,12 @@ class Scheduler:
         if missing:
             _sa_metrics.bump(_sa_metrics.EVENT_SESSION_ARCHIVE_MISSING_BLOCKS)
             _sa_metrics.bump(_sa_metrics.EVENT_RESTORE_REJECTED, reason="missing_blocks")
+            self.runtime_metrics.mark_restore(
+                request.request_id,
+                succeeded=False,
+                duration_ms=(time.perf_counter() - restore_started) * 1000.0,
+                reason="missing_blocks",
+            )
             raise SessionArchiveError(
                 f"gapped session archive: missing block(s) at positions "
                 f"{missing} for session_id={session_id!r} "
@@ -4420,6 +4498,12 @@ class Scheduler:
             num_tokens=len(block_ids) * block_size,
         )
         _sa_metrics.bump(_sa_metrics.EVENT_RESTORE_SUCCEEDED)
+        self.runtime_metrics.mark_restore(
+            request.request_id,
+            succeeded=True,
+            duration_ms=(time.perf_counter() - restore_started) * 1000.0,
+            reason=None,
+        )
 
     def commit_session(self, request: "Request") -> None:
         """Persist the ordered block-hash manifest for the completed turn.
