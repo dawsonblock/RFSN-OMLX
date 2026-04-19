@@ -1,0 +1,11 @@
+# Dev-environment constraints for oMLX.
+#
+# Status: experimental / internal pin set used by
+# scripts/bootstrap_dev_env.sh. The only critical pin here is the
+# mlx-lm git commit: we depend on the post-0.31.1 Gemma 4 tool-call
+# parser and multi-token think/tool support. The nearest tagged
+# release (0.31.1) lacks both, so a tag-based install will silently
+# regress tool-calling and reasoning paths.
+#
+# Do not relax this pin without re-validating those paths.
+mlx-lm @ git+https://github.com/ml-explore/mlx-lm@dcbf6e33d135a1b7c6767ca0fe7ebbd23df814a7
