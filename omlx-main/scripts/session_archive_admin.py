@@ -48,6 +48,8 @@ from omlx.cache import session_archive_metrics as _metrics  # noqa: E402
 from omlx.cache.session_archive import (  # noqa: E402
     SessionArchiveError,
     SessionArchiveStore,
+    ancestry_chain,
+    classify_integrity,
     diff_sessions,
     replay_check,
 )
@@ -95,26 +97,28 @@ def _build_parser() -> argparse.ArgumentParser:
     sub = p.add_subparsers(dest="cmd", required=True)
 
     lp = sub.add_parser("list", help="List sessions for a model")
-    lp.add_argument("--model", required=True)
+    lp.add_argument("--model", "--model-name", dest="model", required=True)
 
     sp = sub.add_parser("show", help="Show one manifest")
-    sp.add_argument("--model", required=True)
-    sp.add_argument("--session", required=True)
+    sp.add_argument("--model", "--model-name", dest="model", required=True)
+    sp.add_argument("--session", "--session-id", dest="session", required=True)
 
     vp = sub.add_parser(
         "validate",
         help="Validate manifests (load + optional SSD block-presence check)",
     )
-    vp.add_argument("--model", required=True)
+    vp.add_argument("--model", "--model-name", dest="model", required=True)
     vp.add_argument(
         "--session",
+        "--session-id",
+        dest="session",
         default=None,
         help="Validate a single session; omit to validate every session.",
     )
 
     dp = sub.add_parser("delete", help="Delete one session manifest directory")
-    dp.add_argument("--model", required=True)
-    dp.add_argument("--session", required=True)
+    dp.add_argument("--model", "--model-name", dest="model", required=True)
+    dp.add_argument("--session", "--session-id", dest="session", required=True)
     dp.add_argument(
         "--yes",
         action="store_true",
@@ -122,7 +126,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
 
     pp = sub.add_parser("prune", help="Prune invalid / expired / over-cap sessions")
-    pp.add_argument("--model", required=True)
+    pp.add_argument("--model", "--model-name", dest="model", required=True)
     pp.add_argument(
         "--invalid",
         action="store_true",
@@ -158,21 +162,46 @@ def _build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("stats", help="Print in-process session archive counters")
 
+    # ------- Workspace-lineage verbs -------
+    cp = sub.add_parser(
+        "create",
+        help="Create an empty workspace (manifest with no turns yet)",
+    )
+    cp.add_argument("--model-name", required=True)
+    cp.add_argument("--session-id", required=True)
+    cp.add_argument("--label", default=None)
+    cp.add_argument("--description", default=None)
+    cp.add_argument("--block-size", type=int, default=None)
+
+    stp = sub.add_parser(
+        "status",
+        help="Compact status block: head? healthy? parent? can-export?",
+    )
+    stp.add_argument("--model-name", required=True)
+    stp.add_argument("--session-id", required=True)
+
+    rsp = sub.add_parser(
+        "resume",
+        help="Alias of status plus next-step hints",
+    )
+    rsp.add_argument("--model-name", required=True)
+    rsp.add_argument("--session-id", required=True)
+
     # ------- Phase 7: lineage / recovery subcommands -------
     tp = sub.add_parser("turns", help="List turns for one session")
-    tp.add_argument("--model-name", required=True)
-    tp.add_argument("--session-id", required=True)
+    tp.add_argument("--model-name", "--model", dest="model_name", required=True)
+    tp.add_argument("--session-id", "--session", dest="session_id", required=True)
 
     hp = sub.add_parser("head", help="Show head turn id and block count")
-    hp.add_argument("--model-name", required=True)
-    hp.add_argument("--session-id", required=True)
+    hp.add_argument("--model-name", "--model", dest="model_name", required=True)
+    hp.add_argument("--session-id", "--session", dest="session_id", required=True)
 
     lp2 = sub.add_parser("lineage", help="Show lineage (label, parent, timestamps)")
-    lp2.add_argument("--model-name", required=True)
-    lp2.add_argument("--session-id", required=True)
+    lp2.add_argument("--model-name", "--model", dest="model_name", required=True)
+    lp2.add_argument("--session-id", "--session", dest="session_id", required=True)
 
     fp = sub.add_parser("fork", help="Fork a session at a given turn (metadata-only)")
-    fp.add_argument("--model-name", required=True)
+    fp.add_argument("--model-name", "--model", dest="model_name", required=True)
     fp.add_argument("--src-session-id", required=True)
     fp.add_argument("--dst-session-id", required=True)
     fp.add_argument("--at-turn", default=None, help="Turn id to fork from (default: head)")
@@ -190,16 +219,24 @@ def _build_parser() -> argparse.ArgumentParser:
         "replay-check",
         help="Validate every block referenced by the session's head is still on SSD",
     )
-    rcp.add_argument("--model-name", required=True)
-    rcp.add_argument("--session-id", required=True)
+    rcp.add_argument("--model-name", "--model", dest="model_name", required=True)
+    rcp.add_argument("--session-id", "--session", dest="session_id", required=True)
     rcp.add_argument("--turn", default=None, help="Turn id (default: head)")
+    rcp.add_argument(
+        "--expected-model-name",
+        default=None,
+        help=(
+            "If set and the manifest's model_name does not match, grade "
+            "incompatible_model without touching the SSD cache."
+        ),
+    )
 
     ep = sub.add_parser(
         "export-session",
         help="Export a session (manifest + SSD blocks) to a tarball bundle",
     )
-    ep.add_argument("--model-name", required=True)
-    ep.add_argument("--session-id", required=True)
+    ep.add_argument("--model-name", "--model", dest="model_name", required=True)
+    ep.add_argument("--session-id", "--session", dest="session_id", required=True)
     ep.add_argument("--out", required=True, type=Path)
     ep.add_argument(
         "--allow-missing-blocks",
@@ -216,6 +253,15 @@ def _build_parser() -> argparse.ArgumentParser:
         "--expected-model-name",
         default=None,
         help="Reject bundle if its model_name does not match this.",
+    )
+    ip.add_argument(
+        "--expected-block-size",
+        type=int,
+        default=None,
+        help=(
+            "Reject bundle if its model_compat.block_size does not match "
+            "this. Guards the compatibility-family invariant."
+        ),
     )
     ip.add_argument("--overwrite-session", action="store_true")
 
@@ -338,7 +384,9 @@ def _cmd_validate(
         status, detail = classify_session(
             store, ssd_cache, args.model, args.session
         )
+        grade = integrity_grade(status)
         print(f"{args.session}\t{status}\t{detail}")
+        print(f"grade\t{grade}")
         return 0 if status == "ok" else 1
 
     failures = 0
@@ -348,7 +396,8 @@ def _cmd_validate(
         status, detail = classify_session(
             store, ssd_cache, args.model, d.session_id
         )
-        print(f"{d.session_id}\t{status}\t{detail}")
+        grade = integrity_grade(status)
+        print(f"{d.session_id}\t{status}\t{detail}\tgrade={grade}")
         if status != "ok":
             failures += 1
     if not any_printed:
@@ -538,15 +587,29 @@ def _cmd_diff(store: SessionArchiveStore, args: argparse.Namespace) -> int:
 def _cmd_replay_check(
     store: SessionArchiveStore, ssd_cache: Any, args: argparse.Namespace
 ) -> int:
-    if ssd_cache is None or not hasattr(ssd_cache, "has_block"):
+    # --expected-model-name short-circuits on incompatible_model without
+    # touching the SSD cache, so we only require --ssd-cache-dir for the
+    # actual block-presence probe.
+    has_block = None
+    if ssd_cache is not None and hasattr(ssd_cache, "has_block"):
+        has_block = ssd_cache.has_block
+    elif not args.expected_model_name:
         print(
             "error: replay-check needs --ssd-cache-dir and a readable paged SSD cache",
             file=sys.stderr,
         )
         return 2
+
+    def _missing_block(_h: bytes) -> bool:
+        return False
+
     rep = replay_check(
-        store, args.model_name, args.session_id,
-        ssd_cache.has_block, turn_id=args.turn,
+        store,
+        args.model_name,
+        args.session_id,
+        has_block if has_block is not None else _missing_block,
+        turn_id=args.turn,
+        expected_model_name=args.expected_model_name,
     )
     print(f"session_id\t{rep.session_id}")
     print(f"head_turn_id\t{rep.head_turn_id}")
@@ -604,6 +667,7 @@ def _cmd_import(
             args.bundle,
             args.ssd_cache_dir,
             expected_model_name=args.expected_model_name,
+            expected_block_size=args.expected_block_size,
             overwrite_session=args.overwrite_session,
         )
     except BundleError as exc:
@@ -615,6 +679,140 @@ def _cmd_import(
     print(f"blocks_written\t{res.blocks_written}")
     print(f"blocks_skipped\t{res.blocks_skipped}")
     return 0
+
+
+# ---------------------------------------------------------------------------
+# Workspace-lineage verbs: create / status / resume
+# ---------------------------------------------------------------------------
+def _cmd_create(
+    store: SessionArchiveStore, args: argparse.Namespace
+) -> int:
+    try:
+        store.init_workspace(
+            args.model_name,
+            args.session_id,
+            label=args.label,
+            description=args.description,
+            block_size=args.block_size,
+        )
+    except SessionArchiveError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    manifest = store.manifest_path(args.model_name, args.session_id)
+    print(f"created\t{args.model_name}/{args.session_id}")
+    print(f"manifest\t{manifest}")
+    print("turns\t0")
+    return 0
+
+
+def _status_lines(
+    store: SessionArchiveStore,
+    ssd_cache: Any,
+    model_name: str,
+    session_id: str,
+) -> tuple[int, list[str]]:
+    """Build the shared status block. Returns (rc, lines)."""
+    lines: list[str] = []
+    try:
+        lin = store.lineage(model_name, session_id)
+    except SessionArchiveError as exc:
+        lines.append(f"error\t{exc}")
+        lines.append(f"grade\t{classify_integrity(store, model_name, session_id)}")
+        return 1, lines
+
+    turns = store.list_turns(model_name, session_id)
+    has_head = bool(lin.head_turn_id) and any(
+        t.turn_id == lin.head_turn_id for t in turns
+    )
+    parent = (
+        f"{lin.parent[0]}@{lin.parent[1]}" if lin.parent is not None else "(root)"
+    )
+
+    # Grade
+    grade = classify_integrity(store, model_name, session_id)
+
+    # Replay probe if ssd cache available and we have a head.
+    replayable: Optional[bool] = None
+    missing_count: Optional[int] = None
+    if has_head and ssd_cache is not None and hasattr(ssd_cache, "has_block"):
+        try:
+            rep = replay_check(
+                store, model_name, session_id, ssd_cache.has_block,
+            )
+            replayable = rep.replayable
+            missing_count = len(rep.missing_blocks)
+            # Replay check can sharpen the grade (missing_blocks).
+            if rep.grade and rep.grade != grade:
+                grade = rep.grade
+        except Exception as exc:  # noqa: BLE001 — operator CLI
+            lines.append(f"replay_error\t{exc}")
+
+    lines.append(f"session_id\t{lin.session_id}")
+    lines.append(f"label\t{lin.label if lin.label is not None else ''}")
+    lines.append(f"head_turn_id\t{lin.head_turn_id}")
+    lines.append(f"turn_count\t{lin.turn_count}")
+    lines.append(f"parent\t{parent}")
+    lines.append(f"has_head\t{has_head}")
+    lines.append(
+        f"model_compat\t{lin.model_compat.model_name} "
+        f"block_size={lin.model_compat.block_size} "
+        f"schema={lin.model_compat.schema}"
+    )
+    if replayable is not None:
+        lines.append(f"replayable\t{replayable}")
+        lines.append(f"missing_blocks\t{missing_count}")
+    # can-export ≈ has_head and (no ssd probe done OR replayable true)
+    can_export = has_head and (replayable is None or replayable)
+    lines.append(f"can_export\t{can_export}")
+    lines.append(f"grade\t{grade}")
+    return 0, lines
+
+
+def _cmd_status(
+    store: SessionArchiveStore, ssd_cache: Any, args: argparse.Namespace
+) -> int:
+    rc, lines = _status_lines(store, ssd_cache, args.model_name, args.session_id)
+    for line in lines:
+        print(line)
+    return rc
+
+
+def _cmd_resume(
+    store: SessionArchiveStore, ssd_cache: Any, args: argparse.Namespace
+) -> int:
+    rc, lines = _status_lines(store, ssd_cache, args.model_name, args.session_id)
+    for line in lines:
+        print(line)
+    # Derive grade from the last printed grade line.
+    grade = ""
+    has_head = False
+    for line in lines:
+        if line.startswith("grade\t"):
+            grade = line.split("\t", 1)[1]
+        elif line.startswith("has_head\t"):
+            has_head = line.split("\t", 1)[1] == "True"
+    print("next_steps:")
+    if rc != 0:
+        print("  - fix the error above (check manifest path / JSON)")
+        return rc
+    if not has_head:
+        print("  - commit your first turn to populate head_turn_id")
+        print("  - then re-run: session_archive_admin resume ...")
+        return 0
+    if grade == "healthy":
+        print("  - fork: session_archive_admin fork --model-name ... --src-session-id ... --dst-session-id ...")
+        print("  - diff: session_archive_admin diff --model-a ... --session-a ... --model-b ... --session-b ...")
+        print("  - export-session: session_archive_admin export-session --model-name ... --session-id ... --out ...")
+    elif grade == "missing_blocks":
+        print("  - blocks have been evicted; export-session with --allow-missing-blocks for a partial bundle")
+        print("  - or prune and restart the task")
+    elif grade == "stale":
+        print("  - workspace is stale; validate, then decide to prune or keep")
+    elif grade == "incompatible_model":
+        print("  - workspace was recorded for a different model; it cannot be replayed here")
+    elif grade in ("invalid_manifest", "unreadable"):
+        print("  - manifest is unreadable; consider delete")
+    return rc
 
 
 # ---------------------------------------------------------------------------
@@ -646,6 +844,12 @@ def main(argv: Optional[list] = None) -> int:
         return _cmd_prune(store, ssd_cache, args)
     if args.cmd == "stats":
         return _cmd_stats(args)
+    if args.cmd == "create":
+        return _cmd_create(store, args)
+    if args.cmd == "status":
+        return _cmd_status(store, ssd_cache, args)
+    if args.cmd == "resume":
+        return _cmd_resume(store, ssd_cache, args)
     if args.cmd == "turns":
         return _cmd_turns(store, args)
     if args.cmd == "head":

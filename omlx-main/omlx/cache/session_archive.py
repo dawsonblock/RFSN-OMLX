@@ -33,6 +33,7 @@ __all__ = [
     "diff_sessions",
     "replay_check",
     "classify_integrity",
+    "ancestry_chain",
     "INTEGRITY_HEALTHY",
     "INTEGRITY_STALE",
     "INTEGRITY_INVALID_MANIFEST",
@@ -231,6 +232,54 @@ class SessionArchiveStore:
 
         self._atomic_write(session_dir, doc)
         return doc["head_turn_id"]
+
+    def init_workspace(
+        self,
+        model_name: str,
+        session_id: str,
+        *,
+        label: Optional[str] = None,
+        description: Optional[str] = None,
+        parent: Optional[Tuple[str, str]] = None,
+        block_size: Optional[int] = None,
+    ) -> None:
+        """Create an empty workspace (manifest with ``turns=[]``).
+
+        Refuses if a manifest already exists for
+        ``(model_name, session_id)``. ``load()`` will still raise
+        ``SessionArchiveError("empty session archive ...")`` until the
+        first :meth:`commit` appends a turn — that invariant is
+        preserved so every existing caller keeps working.
+        """
+        session_dir = self._session_dir(model_name, session_id)
+        manifest = session_dir / _MANIFEST_NAME
+        if manifest.exists():
+            raise SessionArchiveError(
+                f"workspace already exists: model={model_name!r} "
+                f"session_id={session_id!r} at {manifest}"
+            )
+        session_dir.mkdir(parents=True, exist_ok=True)
+        now = time.time()
+        doc: Dict[str, Any] = {
+            "version": MANIFEST_VERSION,
+            "model_name": model_name,
+            "session_id": session_id,
+            "label": label,
+            "description": description,
+            "created_at": now,
+            "updated_at": now,
+            "head_turn_id": "",
+            "parent": (
+                {"session_id": parent[0], "turn_id": parent[1]}
+                if parent is not None
+                else None
+            ),
+            "model_compat": ModelCompat(
+                model_name=model_name, block_size=block_size
+            ).to_dict(),
+            "turns": [],
+        }
+        self._atomic_write(session_dir, doc)
 
     def set_label(
         self,
@@ -469,10 +518,18 @@ class SessionArchiveStore:
                 ) from exc
 
         turns = doc.get("turns")
-        if not isinstance(turns, list) or not turns:
+        if not isinstance(turns, list):
             raise SessionArchiveError(
                 f"malformed manifest: v2 manifest for session_id={session_id!r} "
                 f"is missing turns list"
+            )
+        if not turns:
+            # Empty workspace (e.g. just init'd) — keep the legacy
+            # "empty session archive" vocabulary so callers that pin on
+            # it keep working.
+            raise SessionArchiveError(
+                f"empty session archive: session_id={session_id!r} has no "
+                f"turns yet"
             )
         head_id = doc.get("head_turn_id")
         head = next((t for t in turns if t.get("turn_id") == head_id), None)
@@ -850,3 +907,77 @@ def classify_integrity(
             return INTEGRITY_STALE
 
     return INTEGRITY_HEALTHY
+
+
+# ---------------------------------------------------------------------------
+# Phase 2 (reframe): ancestry walk
+# ---------------------------------------------------------------------------
+def ancestry_chain(
+    store: "SessionArchiveStore",
+    model_name: str,
+    session_id: str,
+    *,
+    max_depth: int = 64,
+) -> List[Tuple[str, str]]:
+    """Walk ``parent`` links upward from a workspace back to the root.
+
+    Returns a list of ``(session_id, turn_id)`` pairs starting with the
+    workspace itself at index 0 and ending at the root (a workspace
+    whose ``parent`` is ``None``). The walk stops:
+
+    * at the root (normal termination — the last entry's ``turn_id`` is
+      the root's ``head_turn_id``),
+    * at an unreachable parent (the parent session does not exist in
+      this archive — the chain still contains every reachable ancestor
+      and the last entry is the parent reference recorded on the first
+      unreachable workspace; callers can detect this by checking that
+      the referenced workspace does not load),
+    * when ``max_depth`` is exceeded (cycle guard — raises
+      :class:`SessionArchiveError`).
+
+    Metadata-only; no SSD access.
+    """
+    out: List[Tuple[str, str]] = []
+    try:
+        doc = store.load_raw(model_name, session_id)
+    except SessionArchiveError as exc:
+        raise SessionArchiveError(
+            f"ancestry_chain: cannot load starting workspace "
+            f"model={model_name!r} session_id={session_id!r}: {exc}"
+        ) from exc
+    current_model = model_name
+    current_session = str(doc.get("session_id") or session_id)
+    current_head = str(doc.get("head_turn_id") or "")
+    out.append((current_session, current_head))
+    seen = {(current_model, current_session)}
+
+    for _ in range(max_depth):
+        parent = doc.get("parent")
+        if not isinstance(parent, dict):
+            return out
+        psid = parent.get("session_id")
+        ptid = parent.get("turn_id")
+        if not isinstance(psid, str) or not isinstance(ptid, str):
+            return out
+        key = (current_model, psid)
+        if key in seen:
+            raise SessionArchiveError(
+                f"ancestry_chain: cycle detected at "
+                f"model={current_model!r} session_id={psid!r}"
+            )
+        seen.add(key)
+        try:
+            parent_doc = store.load_raw(current_model, psid)
+        except SessionArchiveError:
+            # Unreachable parent — record the dangling reference and
+            # return. Caller can detect by trying to load the last
+            # tuple's session_id.
+            out.append((psid, ptid))
+            return out
+        out.append((psid, ptid))
+        doc = parent_doc
+        current_session = psid
+    raise SessionArchiveError(
+        f"ancestry_chain: exceeded max_depth={max_depth} starting from "
+        f"model={model_name!r} session_id={session_id!r}"
+    )

@@ -268,6 +268,7 @@ def import_session(
     ssd_cache_dir: Union[str, os.PathLike],
     *,
     expected_model_name: Optional[str] = None,
+    expected_block_size: Optional[int] = None,
     overwrite_session: bool = False,
 ) -> ImportResult:
     """Verify and materialize a session bundle into ``store`` + SSD layout.
@@ -276,6 +277,9 @@ def import_session(
       * envelope ``bundle_version``
       * SHA-256 for every block file vs. ``block_sha256``
       * ``model_name`` matches ``expected_model_name`` if provided
+      * ``model_compat.block_size`` matches ``expected_block_size`` if
+        provided (compatibility-family guard — refuses cross-family
+        imports before any bytes land on disk)
       * destination session does not already exist unless
         ``overwrite_session`` is True
 
@@ -342,6 +346,16 @@ def import_session(
                 f"bundle envelope/manifest model_name mismatch: "
                 f"{model_name!r} vs {manifest.get('model_name')!r}"
             )
+
+        if expected_block_size is not None:
+            bundled_compat = manifest.get("model_compat") or {}
+            bundled_bs = bundled_compat.get("block_size")
+            if bundled_bs is None or int(bundled_bs) != int(expected_block_size):
+                raise BundleError(
+                    f"compatibility mismatch: bundle block_size="
+                    f"{bundled_bs!r} does not match expected "
+                    f"{int(expected_block_size)!r}"
+                )
 
         # Existing destination guard.
         dst_manifest = store.manifest_path(model_name, session_id)

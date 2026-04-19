@@ -6,6 +6,12 @@
 > for the benchmark verdict. Do not expand this surface (no partial
 > restore, no public API, no UI, no multimodal/hybrid restore) without a
 > concrete operational use case.
+>
+> **Semantics and policy:** see
+> [workspace_lineage.md](./workspace_lineage.md) for the locked
+> vocabulary (workspace, turn, head, branch, replay check, compat
+> family), integrity grades, and operator workflow. This page is the
+> reference for the individual verbs.
 
 This page is a consolidated cheat-sheet for operators. It links to the
 existing scripts and docs; it does not introduce new commands or claims.

@@ -192,6 +192,11 @@ in [tests/test_engine_turn_wiring.py](../tests/test_engine_turn_wiring.py).
 
 ## 10. Appendix — lineage / recovery layer (schema v2)
 
+> **Locked semantics** for workspaces, turns, head, branches, replay
+> check, compatibility family, and integrity grades live in
+> [workspace_lineage.md](./workspace_lineage.md). That document is the
+> single source of truth for the reframed surface.
+
 A later pass added a schema-v2 extension on top of the same
 metadata-only store: per-session `turns[]`, optional `parent` links,
 `model_compat`, and operator-only CLI verbs (`turns`, `head`,
