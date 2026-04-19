@@ -1,15 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Benchmark the first runtime-replacement slice against stock oMLX.
+"""Benchmark the executor-boundary seam against the legacy stock handoff.
 
 This is intentionally blocker-first and conservative. It compares:
 
-- ``stock``  — current oMLX runtime path with the new runtime recorder disabled
-- ``branch`` — current branch with runtime lifecycle tracking enabled and used
-  as the benchmark truth source
+- ``stock`` — the previous direct scheduler -> BatchGenerator handoff
+- ``owned`` — the branch-owned scheduler seam that now controls the decode-step
+  boundary, cancellation suppression, and local finish normalization
 
-It does **not** claim a new faster engine. The purpose is to measure whether
-this branch owns anything meaningful yet and whether the first runtime seam
-adds cost or useful observability.
+It does **not** claim a fully replaced engine. The purpose is to measure
+whether the new seam changes authority and what, if any, overhead it adds.
 """
 
 from __future__ import annotations
@@ -28,7 +27,7 @@ ROOT = Path(__file__).resolve().parents[1]
 WORKER = ROOT / "scripts" / "_bench_runtime_replacement_worker.py"
 DEFAULT_MODEL = "mlx-community/Qwen2.5-0.5B-Instruct-4bit"
 SCENARIOS = ("cold", "restart_cache", "restart_restore")
-PATHS = ("stock", "branch")
+PATHS = ("stock", "owned")
 
 
 def _run_worker(env_overlay: dict, timeout: int = 900) -> dict:
@@ -84,6 +83,9 @@ def _summarize(rows: list[dict]) -> dict:
         "cache_hit_count": sum(1 for r in rows if r["turn"].get("cache_hit")),
         "restore_success_count": sum(1 for r in rows if r["turn"].get("restore_succeeded")),
         "peak_batch_size": max(int(r["turn"].get("peak_batch_size", 0) or 0) for r in rows),
+        "executor_steps_last": int(sample.get("executor_steps", 0) or 0),
+        "executor_finish_overrides_last": int(sample.get("executor_finish_overrides", 0) or 0),
+        "executor_cancel_suppressed_last": int(sample.get("executor_cancel_suppressed", 0) or 0),
         "resident_blocks_last": int(sample.get("resident_blocks", 0) or 0),
         "cached_after_add_last": int(sample.get("cached_after_add", 0) or 0),
         "shared_prefix_blocks_last": int(sample.get("shared_prefix_blocks", 0) or 0),

@@ -14,6 +14,7 @@ The scheduler follows vLLM's design with:
 import copy
 import gc
 import logging
+import os
 import time
 import types
 from collections import deque
@@ -365,6 +366,16 @@ class SchedulerOutput:
     has_work: bool = False
 
 
+@dataclass
+class _ExecutorStepOutcome:
+    """Result of one branch-owned decode step."""
+
+    responses: List[Any] = field(default_factory=list)
+    finished_request_ids: Set[str] = field(default_factory=set)
+    suppressed_request_ids: Set[str] = field(default_factory=set)
+    finish_overrides: int = 0
+
+
 class _BoundarySnapshotProvider:
     """Dict-like lazy loader for boundary snapshots.
 
@@ -480,6 +491,8 @@ class Scheduler:
         self.requests: Dict[str, Request] = {}  # All requests by ID
         self.finished_req_ids: Set[str] = set()  # Recently finished
         self.runtime_metrics = RuntimeMetricsRecorder()
+        self._executor_boundary_mode = self._resolve_executor_boundary_mode()
+        self.runtime_metrics.note_executor_boundary_mode(self._executor_boundary_mode)
 
         # Thread-safe set for deferred aborts (main thread → executor thread)
         # CPython GIL guarantees set.add() and `x in set` are atomic.
@@ -3777,13 +3790,117 @@ class Scheduler:
             logger.info(f"Rescheduled {count} requests for re-prefill")
         return failed_ids
 
+    def _resolve_executor_boundary_mode(self) -> str:
+        """Return the internal executor-boundary mode.
+
+        ``owned`` is the new scheduler-owned seam. ``stock`` keeps the old
+        direct BatchGenerator handoff for controlled comparison only.
+        """
+        mode = os.environ.get("OMLX_EXECUTOR_BOUNDARY_MODE", "owned")
+        mode = mode.strip().lower()
+        if mode not in {"owned", "stock"}:
+            logger.warning(
+                "Unknown OMLX_EXECUTOR_BOUNDARY_MODE=%r; defaulting to owned", mode
+            )
+            return "owned"
+        return mode
+
+    def _clone_response_with_finish_reason(
+        self, response: Any, finish_reason: Optional[str]
+    ) -> Any:
+        """Return a response object with a locally-normalized finish reason."""
+        if getattr(response, "finish_reason", None) == finish_reason:
+            return response
+        try:
+            cloned = copy.copy(response)
+            cloned.finish_reason = finish_reason
+            return cloned
+        except Exception:
+            return types.SimpleNamespace(
+                uid=getattr(response, "uid", None),
+                token=getattr(response, "token", None),
+                finish_reason=finish_reason,
+                prompt_cache=getattr(response, "prompt_cache", None),
+                logprobs=getattr(response, "logprobs", None),
+            )
+
+    def _run_owned_decode_step(self) -> _ExecutorStepOutcome:
+        """Own one real executor seam: decode-step control and finish filtering.
+
+        The low-level model forward pass is still delegated to the current MLX
+        generator, but the scheduler now decides which responses are allowed to
+        advance request state, which ones are suppressed after cancellation, and
+        when a request has locally exhausted its generation budget.
+        """
+        outcome = _ExecutorStepOutcome()
+        if self.batch_generator is None or not self.running:
+            self.runtime_metrics.mark_executor_step(
+                mode=self._executor_boundary_mode,
+                response_count=0,
+            )
+            return outcome
+
+        raw_responses = self.batch_generator.next_generated() or []
+        removed_uids: List[int] = []
+
+        for response in raw_responses:
+            request_id = self.uid_to_request_id.get(getattr(response, "uid", None))
+            if request_id is None:
+                outcome.suppressed_request_ids.add(f"uid:{getattr(response, 'uid', None)}")
+                continue
+
+            request = self.running.get(request_id)
+            if request is None:
+                outcome.suppressed_request_ids.add(request_id)
+                continue
+
+            if request_id in self._pending_abort_ids:
+                request.set_finished(RequestStatus.FINISHED_ABORTED)
+                self.runtime_metrics.mark_finished(
+                    request_id,
+                    finish_reason="abort",
+                    completion_tokens=request.num_output_tokens,
+                )
+                self._pending_abort_ids.discard(request_id)
+                outcome.finished_request_ids.add(request_id)
+                outcome.suppressed_request_ids.add(request_id)
+                uid = self.request_id_to_uid.get(request_id)
+                if uid is not None:
+                    removed_uids.append(uid)
+                continue
+
+            finish_reason = getattr(response, "finish_reason", None)
+            max_tokens = int(getattr(request.sampling_params, "max_tokens", 0) or 0)
+            if finish_reason is None and max_tokens > 0:
+                next_completion_tokens = request.num_output_tokens + 1
+                if next_completion_tokens >= max_tokens:
+                    response = self._clone_response_with_finish_reason(response, "length")
+                    outcome.finish_overrides += 1
+
+            outcome.responses.append(response)
+
+        if removed_uids and self.batch_generator is not None:
+            try:
+                self.batch_generator.remove(removed_uids)
+            except Exception:
+                logger.debug("Executor boundary could not remove aborted UIDs", exc_info=True)
+
+        self.runtime_metrics.mark_executor_step(
+            mode=self._executor_boundary_mode,
+            response_count=len(outcome.responses),
+            suppressed_count=len(outcome.suppressed_request_ids),
+            finish_overrides=outcome.finish_overrides,
+        )
+        return outcome
+
     def step(self) -> SchedulerOutput:
         """
         Execute one scheduling step with automatic error recovery.
 
         This method:
         1. Schedules waiting requests into the batch
-        2. Runs one generation step via BatchGenerator
+        2. Runs one generation step through the owned executor seam or the
+           legacy stock handoff
         3. Processes outputs and handles finished requests
         4. On cache corruption: clears all cache and reschedules requests
            for re-prefill (no error raised to caller)
@@ -3814,12 +3931,27 @@ class Scheduler:
             # objects (prefill is handled externally before insert).
             if self.batch_generator is not None and self.running:
                 self.runtime_metrics.mark_batch(len(self.running))
-                responses = self.batch_generator.next_generated()
                 output.has_work = True
 
+                boundary_finished_ids: Set[str] = set()
+                if self._executor_boundary_mode == "owned":
+                    step_outcome = self._run_owned_decode_step()
+                    responses = step_outcome.responses
+                    boundary_finished_ids = set(step_outcome.finished_request_ids)
+                else:
+                    responses = self.batch_generator.next_generated()
+                    self.runtime_metrics.mark_executor_step(
+                        mode=self._executor_boundary_mode,
+                        response_count=len(responses or []),
+                    )
+
+                finished_ids: Set[str] = set(boundary_finished_ids)
                 if responses:
-                    outputs, finished_ids = self._process_batch_responses(responses)
+                    outputs, processed_finished_ids = self._process_batch_responses(responses)
                     output.outputs = outputs
+                    finished_ids.update(processed_finished_ids)
+
+                if finished_ids:
                     output.finished_request_ids = finished_ids
                     self._cleanup_finished(finished_ids)
 

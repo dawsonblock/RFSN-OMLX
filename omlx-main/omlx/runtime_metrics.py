@@ -12,9 +12,9 @@ one authoritative place to record request lifecycle truth:
 - decode completion
 - batch-size behavior
 
-It does **not** change decode policy or batching semantics. The goal of this
-first pass is ownership of measurement and request lifecycle observability so a
-future runtime replacement can be judged from evidence rather than guesswork.
+It does **not** replace the low-level MLX executor. The current goal is to own
+runtime truth and the scheduler-side executor boundary so future replacement
+work can be judged from evidence rather than guesswork.
 """
 
 from __future__ import annotations
@@ -140,6 +140,11 @@ class RuntimeMetricsRecorder:
         self._completed: List[RequestRuntimeTrace] = []
         self._batch_samples: List[int] = []
         self._peak_batch_size: int = 0
+        self._executor_boundary_mode: str = "unknown"
+        self._executor_steps: int = 0
+        self._executor_response_count: int = 0
+        self._executor_cancel_suppressed: int = 0
+        self._executor_finish_overrides: int = 0
 
     def admit_request(
         self,
@@ -261,6 +266,25 @@ class RuntimeMetricsRecorder:
         if len(self._completed) > self.max_completed:
             self._completed = self._completed[-self.max_completed :]
 
+    def note_executor_boundary_mode(self, mode: str) -> None:
+        self._executor_boundary_mode = str(mode or "unknown")
+
+    def mark_executor_step(
+        self,
+        *,
+        mode: str,
+        response_count: int,
+        suppressed_count: int = 0,
+        finish_overrides: int = 0,
+    ) -> None:
+        self.note_executor_boundary_mode(mode)
+        if not self.enabled:
+            return
+        self._executor_steps += 1
+        self._executor_response_count += int(response_count or 0)
+        self._executor_cancel_suppressed += int(suppressed_count or 0)
+        self._executor_finish_overrides += int(finish_overrides or 0)
+
     def get_request_snapshot(self, request_id: str) -> Optional[Dict[str, Any]]:
         trace = self._active.get(request_id)
         if trace is not None:
@@ -283,6 +307,11 @@ class RuntimeMetricsRecorder:
         total_vals = [r["total_ms"] for r in request_rows if r["total_ms"] > 0]
         return {
             "enabled": self.enabled,
+            "executor_boundary_mode": self._executor_boundary_mode,
+            "executor_steps": self._executor_steps,
+            "executor_responses": self._executor_response_count,
+            "executor_cancel_suppressed": self._executor_cancel_suppressed,
+            "executor_finish_overrides": self._executor_finish_overrides,
             "requests_tracked": len(self._active) + len(self._completed),
             "completed_requests": len(self._completed),
             "peak_batch_size": self._peak_batch_size,
@@ -315,3 +344,7 @@ class RuntimeMetricsRecorder:
         self._completed.clear()
         self._batch_samples.clear()
         self._peak_batch_size = 0
+        self._executor_steps = 0
+        self._executor_response_count = 0
+        self._executor_cancel_suppressed = 0
+        self._executor_finish_overrides = 0

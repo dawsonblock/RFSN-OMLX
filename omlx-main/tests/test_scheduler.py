@@ -1801,3 +1801,100 @@ class TestVLMPositionStateClearing:
         scheduler._schedule_waiting()
 
         model.clear_vlm_position_state.assert_called_once()
+
+
+class TestExecutorBoundaryOwnership:
+    """Focused tests for the branch-owned executor boundary seam."""
+
+    def _make_running_request(self, *, request_id: str = "req-1", uid: int = 7, max_tokens: int = 2):
+        req = Request(
+            request_id=request_id,
+            prompt="hello",
+            sampling_params=SamplingParams(max_tokens=max_tokens),
+            prompt_token_ids=[1, 2, 3],
+            num_prompt_tokens=3,
+            status=RequestStatus.RUNNING,
+            batch_uid=uid,
+        )
+        return req
+
+    def test_owned_executor_boundary_normalizes_length_finish(
+        self, mock_model, mock_tokenizer
+    ):
+        """Scheduler-owned seam should cap by local request budget."""
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        scheduler.runtime_metrics.enabled = True
+        scheduler._get_detokenizer = MagicMock(return_value=None)
+
+        req = self._make_running_request(max_tokens=1)
+        scheduler.running[req.request_id] = req
+        scheduler.requests[req.request_id] = req
+        scheduler.request_id_to_uid[req.request_id] = req.batch_uid
+        scheduler.uid_to_request_id[req.batch_uid] = req.request_id
+
+        response = type(
+            "Resp", (), {"uid": req.batch_uid, "token": 123, "finish_reason": None}
+        )()
+        scheduler.batch_generator = MagicMock()
+        scheduler.batch_generator.next_generated.return_value = [response]
+
+        out = scheduler.step()
+
+        assert out.outputs
+        assert out.outputs[0].finished is True
+        assert out.outputs[0].finish_reason == "length"
+        assert req.status == RequestStatus.FINISHED_LENGTH_CAPPED
+
+    def test_owned_executor_boundary_suppresses_cancelled_response(
+        self, mock_model, mock_tokenizer
+    ):
+        """Cancelled requests must not emit a fresh token through the seam."""
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        scheduler.runtime_metrics.enabled = True
+        scheduler._get_detokenizer = MagicMock(return_value=None)
+
+        req = self._make_running_request(max_tokens=4)
+        scheduler.running[req.request_id] = req
+        scheduler.requests[req.request_id] = req
+        scheduler.request_id_to_uid[req.request_id] = req.batch_uid
+        scheduler.uid_to_request_id[req.batch_uid] = req.request_id
+        scheduler._pending_abort_ids.add(req.request_id)
+
+        response = type(
+            "Resp", (), {"uid": req.batch_uid, "token": 321, "finish_reason": None}
+        )()
+        scheduler.batch_generator = MagicMock()
+        scheduler.batch_generator.next_generated.return_value = [response]
+        scheduler._process_pending_aborts = MagicMock()
+
+        out = scheduler.step()
+
+        assert out.outputs == []
+        assert req.output_token_ids == []
+
+    def test_runtime_metrics_snapshot_reports_executor_boundary_mode(
+        self, mock_model, mock_tokenizer
+    ):
+        """Runtime metrics should expose which executor seam path handled the step."""
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        scheduler.runtime_metrics.enabled = True
+        scheduler._get_detokenizer = MagicMock(return_value=None)
+
+        req = self._make_running_request(max_tokens=1)
+        scheduler.running[req.request_id] = req
+        scheduler.requests[req.request_id] = req
+        scheduler.request_id_to_uid[req.request_id] = req.batch_uid
+        scheduler.uid_to_request_id[req.batch_uid] = req.request_id
+
+        response = type(
+            "Resp", (), {"uid": req.batch_uid, "token": 456, "finish_reason": None}
+        )()
+        scheduler.batch_generator = MagicMock()
+        scheduler.batch_generator.next_generated.return_value = [response]
+
+        scheduler.step()
+        snap = scheduler.get_runtime_metrics_snapshot()
+
+        assert snap["executor_boundary_mode"] == "owned"
+        assert snap["executor_steps"] >= 1
+        assert snap["executor_finish_overrides"] >= 1

@@ -1,14 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Benchmark worker for the runtime-replacement first pass.
+"""Benchmark worker for the executor-boundary ownership pass.
 
 This worker compares two paths on identical scheduler/model/workload input:
 
-- ``stock``  — current oMLX runtime path with the new recorder disabled
-- ``branch`` — current branch with runtime lifecycle measurement enabled
+- ``stock`` — the legacy direct handoff to BatchGenerator
+- ``owned`` — the scheduler-owned executor seam
 
-The goal is not to market speed. The goal is to prove whether the branch owns
-anything meaningful yet, and whether the first ownership slice (request
-lifecycle measurement + benchmark seam) changes behavior or cost.
+The goal is not to market speed. The goal is to prove whether the branch now
+owns a real slice of the request-to-execution flow and what cost that adds.
 """
 
 from __future__ import annotations
@@ -143,6 +142,10 @@ def _drive_turn(sch, prompt: str, *, session_id, restore: bool, max_tokens: int)
         "avg_batch_size": float(req_snap.get("avg_batch_size", snap.get("avg_batch_size", 1.0)) or 0.0),
         "peak_batch_size": int(req_snap.get("peak_batch_size", snap.get("peak_batch_size", 1)) or 0),
         "tail_ms_p95": float(snap.get("tail_ms_p95", total_ms) or total_ms),
+        "executor_boundary_mode": str(snap.get("executor_boundary_mode", "unknown") or "unknown"),
+        "executor_steps": int(snap.get("executor_steps", 0) or 0),
+        "executor_finish_overrides": int(snap.get("executor_finish_overrides", 0) or 0),
+        "executor_cancel_suppressed": int(snap.get("executor_cancel_suppressed", 0) or 0),
         "cache_stats": _jsonable(sch.get_cache_stats() or {}),
         "ssd_stats": _jsonable(sch.get_ssd_cache_stats() or {}),
     }
@@ -161,8 +164,9 @@ def main() -> None:
     from omlx.utils.model_loading import load_text_model
 
     model, tokenizer = load_text_model(model_name)
+    os.environ["OMLX_EXECUTOR_BOUNDARY_MODE"] = path
     sch = _make_scheduler(model, tokenizer, ssd, archive, model_name)
-    sch.runtime_metrics.enabled = path == "branch"
+    sch.runtime_metrics.enabled = True
 
     prompt = _make_prompt(tokenizer, prompt_tokens)
     if scenario == "cold":
