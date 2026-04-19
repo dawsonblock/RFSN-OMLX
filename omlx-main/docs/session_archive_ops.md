@@ -178,7 +178,7 @@ KV payload bytes.
 | --- | --- |
 | `create --model-name M --session-id S [--label L] [--description D] [--task-tag TAG]` | Create an empty workspace manifest with optional human-readable metadata. |
 | `status --model-name M --session-id S [--stale-after 7d] [--expected-model-name M]` | One-screen summary: label, description, task tag, head turn, parent/ancestry, turn count, integrity grade, replay/export readiness. |
-| `resume --model-name M --session-id S` | `status` plus next-step hints (`fork`, `diff`, `export-session`, etc.). |
+| `resume --model-name M --session-id S` | `status` plus next-step hints (`fork`, `diff`, `export-session`, etc.). Exits non-zero when the workspace is invalid, incompatible, or missing required blocks. |
 | `turns --model-name M --session-id S` | List every turn of a session (`turn_id`, `committed_at`, block count, note, `branch_reason`). |
 | `head --model-name M --session-id S` | Print `head_turn_id` and its block count. |
 | `lineage --model-name M --session-id S` | Session metadata + parent link + turn count + model_compat. |
@@ -197,7 +197,7 @@ KV payload bytes.
 | --- | --- |
 | `healthy` | Manifest loads, model_compat matches (when checked), all head-turn blocks present in the SSD cache. |
 | `stale` | Healthy but `updated_at` is older than the configured threshold. |
-| `invalid_manifest` | File missing, truncated, JSON error, or schema error. |
+| `invalid_manifest` | File missing, truncated, JSON error, or schema error. Surfaced conservatively; the archive does not silently overwrite a malformed manifest on the next commit. |
 | `missing_blocks` | Manifest loads but one or more head-turn blocks are absent from the SSD cache. |
 | `incompatible_model` | Manifest's `model_compat.model_name` does not match the expected model. |
 | `unreadable` | I/O error reaching the manifest file. |

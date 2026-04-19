@@ -85,6 +85,9 @@ never change. A failed request does not mutate the existing head.
 `head_turn_id` MUST match exactly one turn in the `turns` array. A
 manifest whose `head_turn_id` does not resolve is rejected with
 `malformed manifest: head_turn_id=... does not match any recorded turn`.
+Malformed or truncated manifests are surfaced as trust failures and are
+**not** silently repaired by a later `commit()`; operator action is
+required before writing a fresh workspace state.
 
 ### 4.3 Empty workspace is not "malformed"
 A workspace with `turns=[]` is an **empty workspace** (produced by

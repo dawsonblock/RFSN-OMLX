@@ -217,22 +217,21 @@ class SessionArchiveStore:
         task_tag = _validate_task_tag(task_tag)
 
         session_dir = self._session_dir(model_name, session_id)
+        manifest = session_dir / _MANIFEST_NAME
+        if not manifest.exists() and session_dir.exists() and any(session_dir.iterdir()):
+            raise SessionArchiveError(
+                f"workspace already exists: model={model_name!r} session_id={session_id!r} "
+                f"directory is not empty at {session_dir}"
+            )
         session_dir.mkdir(parents=True, exist_ok=True)
 
         now = time.time()
         existing_doc: Optional[Dict[str, Any]] = None
         if self.manifest_path(model_name, session_id).exists():
-            # Unreadable/malformed manifests are replaced atomically — a
-            # fresh commit must never be blocked by a prior crash.
-            try:
-                existing_doc = self._load_doc(model_name, session_id)
-            except SessionArchiveError:
-                _log.warning(
-                    "session archive: discarding malformed manifest for "
-                    "model=%r session=%r and starting a new lineage",
-                    model_name, session_id,
-                )
-                existing_doc = None
+            # Trust policy: never silently repair or replace a malformed
+            # manifest on commit. Operators must see the corruption and
+            # decide what to do.
+            existing_doc = self._load_doc(model_name, session_id)
 
         def _new_turn(turn_id: str) -> Dict[str, Any]:
             t: Dict[str, Any] = {
@@ -268,6 +267,7 @@ class SessionArchiveStore:
             }
         else:
             doc = self._upgrade_to_v2(existing_doc, session_dir)
+            self._validate_v2_doc(model_name, session_id, doc)
             next_idx = len(doc["turns"]) + 1
             turn_id = make_turn_id(next_idx)
             doc["turns"].append(_new_turn(turn_id))
@@ -317,10 +317,10 @@ class SessionArchiveStore:
         task_tag = _validate_task_tag(task_tag)
         session_dir = self._session_dir(model_name, session_id)
         manifest = session_dir / _MANIFEST_NAME
-        if manifest.exists():
+        if manifest.exists() or (session_dir.exists() and any(session_dir.iterdir())):
             raise SessionArchiveError(
                 f"workspace already exists: model={model_name!r} "
-                f"session_id={session_id!r} at {manifest}"
+                f"session_id={session_id!r} at {session_dir}"
             )
         session_dir.mkdir(parents=True, exist_ok=True)
         now = time.time()
@@ -447,6 +447,8 @@ class SessionArchiveStore:
     def load(self, model_name: str, session_id: str) -> List[bytes]:
         try:
             doc = self._load_doc(model_name, session_id)
+            doc = self._upgrade_to_v2(doc, self._session_dir(model_name, session_id))
+            self._validate_v2_doc(model_name, session_id, doc)
             hashes = self._head_hashes(doc, session_id)
         except SessionArchiveError as exc:
             reason = _classify_load_error(str(exc))
@@ -473,7 +475,9 @@ class SessionArchiveStore:
     def load_raw(self, model_name: str, session_id: str) -> Dict[str, Any]:
         doc = self._load_doc(model_name, session_id)
         session_dir = self._session_dir(model_name, session_id)
-        return self._upgrade_to_v2(doc, session_dir)
+        doc = self._upgrade_to_v2(doc, session_dir)
+        self._validate_v2_doc(model_name, session_id, doc)
+        return doc
 
     def load_head(
         self, model_name: str, session_id: str
@@ -646,6 +650,90 @@ class SessionArchiveStore:
                 f"has non-hex block entries ({exc})"
             ) from exc
 
+    def _validate_v2_doc(
+        self, model_name: str, session_id: str, doc: Dict[str, Any]
+    ) -> None:
+        if doc.get("version") != MANIFEST_VERSION:
+            return
+
+        _validate_short_text("label", doc.get("label"), max_len=_MAX_LABEL_LEN)
+        _validate_short_text(
+            "description", doc.get("description"), max_len=_MAX_DESCRIPTION_LEN
+        )
+        _validate_task_tag(doc.get("task_tag"))
+
+        turns = doc.get("turns")
+        if not isinstance(turns, list):
+            raise SessionArchiveError(
+                f"malformed manifest: v2 manifest for session_id={session_id!r} "
+                f"is missing turns list"
+            )
+
+        seen: set[str] = set()
+        for idx, turn in enumerate(turns, start=1):
+            if not isinstance(turn, dict):
+                raise SessionArchiveError(
+                    f"malformed manifest: turn #{idx} for session_id={session_id!r} "
+                    f"is not an object"
+                )
+            turn_id = turn.get("turn_id")
+            if not isinstance(turn_id, str):
+                raise SessionArchiveError(
+                    f"malformed manifest: turn #{idx} for session_id={session_id!r} "
+                    f"is missing a string turn_id"
+                )
+            if turn_id in seen:
+                raise SessionArchiveError(
+                    f"malformed manifest: duplicate turn_id={turn_id!r} for "
+                    f"session_id={session_id!r}"
+                )
+            seen.add(turn_id)
+            expected_turn_id = make_turn_id(idx)
+            if turn_id != expected_turn_id:
+                raise SessionArchiveError(
+                    f"malformed manifest: out-of-order turn history for "
+                    f"session_id={session_id!r}; expected {expected_turn_id!r}, "
+                    f"got {turn_id!r}"
+                )
+            _validate_short_text("note", turn.get("note"), max_len=_MAX_NOTE_LEN)
+            _validate_short_text(
+                "branch_reason",
+                turn.get("branch_reason"),
+                max_len=_MAX_BRANCH_REASON_LEN,
+            )
+            if not isinstance(turn.get("block_hashes") or [], list):
+                raise SessionArchiveError(
+                    f"malformed manifest: turn {turn_id!r} for session_id={session_id!r} "
+                    f"is missing block_hashes list"
+                )
+
+        parent_doc = doc.get("parent")
+        if parent_doc is not None:
+            if not isinstance(parent_doc, dict):
+                raise SessionArchiveError(
+                    f"malformed manifest: parent for session_id={session_id!r} must be an object"
+                )
+            psid = parent_doc.get("session_id")
+            ptid = parent_doc.get("turn_id")
+            if not isinstance(psid, str) or not isinstance(ptid, str):
+                raise SessionArchiveError(
+                    f"malformed manifest: parent for session_id={session_id!r} must carry string session_id and turn_id"
+                )
+            if psid == session_id:
+                raise SessionArchiveError(
+                    f"malformed manifest: self-referential parent for session_id={session_id!r}"
+                )
+            parent_manifest = self.manifest_path(model_name, psid)
+            if parent_manifest.exists():
+                parent_raw = self._load_doc(model_name, psid)
+                parent_v2 = self._upgrade_to_v2(parent_raw, self._session_dir(model_name, psid))
+                parent_turns = parent_v2.get("turns") or []
+                if not any(t.get("turn_id") == ptid for t in parent_turns if isinstance(t, dict)):
+                    raise SessionArchiveError(
+                        f"malformed manifest: missing parent turn {ptid!r} in "
+                        f"workspace {psid!r} for session_id={session_id!r}"
+                    )
+
     def _upgrade_to_v2(
         self, doc: Dict[str, Any], session_dir: Path
     ) -> Dict[str, Any]:
@@ -669,10 +757,6 @@ class SessionArchiveStore:
                 if isinstance(turn, dict):
                     turn.setdefault("note", None)
                     turn.setdefault("branch_reason", None)
-            if not doc.get("head_turn_id") and doc["turns"]:
-                doc["head_turn_id"] = doc["turns"][-1].get(
-                    "turn_id"
-                ) or make_turn_id(len(doc["turns"]))
             return doc
 
         manifest = session_dir / _MANIFEST_NAME

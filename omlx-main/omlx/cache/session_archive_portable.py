@@ -214,6 +214,20 @@ def inspect_bundle(bundle_path: Union[str, os.PathLike]) -> Dict[str, Any]:
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, ValueError, OSError) as exc:
             raise BundleError(f"bundle metadata unreadable: {exc}") from exc
+
+    if not isinstance(envelope, dict) or not isinstance(manifest, dict):
+        raise BundleError("bundle metadata unreadable: envelope/manifest must be objects")
+    for key in _ENVELOPE_KEYS:
+        if key not in envelope:
+            raise BundleError(f"bundle envelope missing required key {key!r}")
+    if envelope.get("bundle_version") != BUNDLE_VERSION:
+        raise BundleError(
+            f"bundle version mismatch: got {envelope.get('bundle_version')!r}, expected {BUNDLE_VERSION!r}"
+        )
+    if manifest.get("version") != MANIFEST_VERSION:
+        raise BundleError(
+            f"bundled manifest must be schema v{MANIFEST_VERSION} (got {manifest.get('version')!r})"
+        )
     return {"envelope": envelope, "manifest": manifest}
 
 
@@ -241,6 +255,11 @@ def export_session(
     ssd_dir = Path(ssd_cache_dir)
     out = Path(out_path)
     out.parent.mkdir(parents=True, exist_ok=True)
+
+    if not doc.get("turns") or not doc.get("head_turn_id"):
+        raise BundleError(
+            f"cannot export: empty session archive for model={model_name!r} session_id={session_id!r}"
+        )
 
     # Collect all referenced block hashes across all turns, deduped.
     hex_hashes: List[str] = []
@@ -413,6 +432,11 @@ def import_session(
                 f"{envelope['bundle_version']!r}, expected "
                 f"{BUNDLE_VERSION!r}"
             )
+        if envelope.get("source_cache_layout") != _CACHE_LAYOUT:
+            raise BundleError(
+                f"bundle source_cache_layout mismatch: got "
+                f"{envelope.get('source_cache_layout')!r}, expected {_CACHE_LAYOUT!r}"
+            )
         if manifest.get("version") != MANIFEST_VERSION:
             raise BundleError(
                 f"bundled manifest must be schema v{MANIFEST_VERSION} "
@@ -432,6 +456,14 @@ def import_session(
                 f"{model_name!r} vs {manifest.get('model_name')!r}"
             )
 
+        env_compat = envelope.get("model_compat") or {}
+        if env_compat:
+            env_model = env_compat.get("model_name")
+            if env_model not in (None, "", model_name):
+                raise BundleError(
+                    f"bundle provenance model_compat mismatch: {env_model!r} vs {model_name!r}"
+                )
+
         if expected_block_size is not None:
             bundled_compat = manifest.get("model_compat") or {}
             bundled_bs = bundled_compat.get("block_size")
@@ -446,19 +478,22 @@ def import_session(
         # fail on conflict, unless the operator explicitly asks for
         # overwrite or deterministic rename.
         original_session_id = session_id
+        dst_session_dir = store._session_dir(model_name, session_id)  # noqa: SLF001
         dst_manifest = store.manifest_path(model_name, session_id)
-        if dst_manifest.exists():
+        dst_exists = dst_session_dir.exists() and any(dst_session_dir.iterdir())
+        if dst_exists:
             if overwrite_session:
-                pass
+                shutil.rmtree(dst_session_dir)
+                dst_manifest = store.manifest_path(model_name, session_id)
             elif rename_on_conflict:
                 suffix = 1
                 while True:
                     candidate = f"{original_session_id}-imported-{suffix}"
-                    candidate_manifest = store.manifest_path(model_name, candidate)
-                    if not candidate_manifest.exists():
+                    candidate_dir = store._session_dir(model_name, candidate)  # noqa: SLF001
+                    if not (candidate_dir.exists() and any(candidate_dir.iterdir())):
                         session_id = candidate
                         manifest["session_id"] = candidate
-                        dst_manifest = candidate_manifest
+                        dst_manifest = store.manifest_path(model_name, candidate)
                         break
                     suffix += 1
             else:

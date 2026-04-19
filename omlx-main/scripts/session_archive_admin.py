@@ -447,11 +447,13 @@ def _cmd_show(
     print(f"  parent:      {doc.get('parent')!r}")
     turns = doc.get("turns") or []
     print(f"  turn_count:  {len(turns)}")
-    if turns:
-        head_note = (turns[-1] or {}).get("note")
-        head_reason = (turns[-1] or {}).get("branch_reason")
-        print(f"  head_note:   {head_note!r}")
-        print(f"  branch_why:  {head_reason!r}")
+    head_id = doc.get("head_turn_id")
+    head = next((t for t in turns if isinstance(t, dict) and t.get("turn_id") == head_id), None)
+    if head is not None:
+        head_hashes = head.get("block_hashes") or []
+        print(f"  head_blocks: {len(head_hashes)}")
+        print(f"  head_note:   {head.get('note')!r}")
+        print(f"  branch_why:  {head.get('branch_reason')!r}")
     status, detail = classify_session(
         store, ssd_cache, args.model, args.session
     )
@@ -480,7 +482,7 @@ def _cmd_validate(
         ) if status == "ok" else integrity_grade(status)
         print(f"{args.session}\t{status}\t{detail}")
         print(f"grade\t{grade}")
-        return 0 if status == "ok" else 1
+        return 0 if grade in ("healthy", "stale") else 1
 
     failures = 0
     any_printed = False
@@ -497,7 +499,7 @@ def _cmd_validate(
             stale_after_seconds=stale_after_seconds,
         ) if status == "ok" else integrity_grade(status)
         print(f"{d.session_id}\t{status}\t{detail}\tgrade={grade}")
-        if status != "ok":
+        if grade not in ("healthy", "stale"):
             failures += 1
     if not any_printed:
         print(f"(no sessions for model {args.model!r})")
@@ -892,6 +894,11 @@ def _status_lines(
     parent = (
         f"{lin.parent[0]}@{lin.parent[1]}" if lin.parent is not None else "(root)"
     )
+    if lin.parent is None:
+        parent_status = "root"
+    else:
+        parent_manifest = store.manifest_path(model_name, lin.parent[0])
+        parent_status = "present" if parent_manifest.exists() else "dangling"
 
     # Grade
     grade = classify_integrity(
@@ -928,6 +935,7 @@ def _status_lines(
     lines.append(f"head_turn_id\t{lin.head_turn_id}")
     lines.append(f"turn_count\t{lin.turn_count}")
     lines.append(f"parent\t{parent}")
+    lines.append(f"parent_status\t{parent_status}")
     if lin.parent is not None:
         lines.append(f"branch_origin\t{lin.parent[0]}@{lin.parent[1]}")
     lines.append(f"last_updated\t{last_updated}")
@@ -1006,7 +1014,7 @@ def _cmd_resume(
     if not has_head:
         print("  - commit your first turn to populate head_turn_id")
         print("  - then re-run: session_archive_admin resume ...")
-        return 0
+        return 1
     if grade == "healthy":
         print("  - fork: session_archive_admin fork --model-name ... --src-session-id ... --dst-session-id ...")
         print("  - diff: session_archive_admin diff --model-a ... --session-a ... --model-b ... --session-b ...")
@@ -1014,12 +1022,16 @@ def _cmd_resume(
     elif grade == "missing_blocks":
         print("  - blocks have been evicted; export-session with --allow-missing-blocks for a partial bundle")
         print("  - or prune and restart the task")
+        return 1
     elif grade == "stale":
         print("  - workspace is stale; validate, then decide to prune or keep")
+        return 0
     elif grade == "incompatible_model":
         print("  - workspace was recorded for a different model; it cannot be replayed here")
+        return 1
     elif grade in ("invalid_manifest", "unreadable"):
         print("  - manifest is unreadable; consider delete")
+        return 1
     return rc
 
 

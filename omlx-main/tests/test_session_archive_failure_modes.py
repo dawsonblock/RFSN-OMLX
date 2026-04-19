@@ -65,7 +65,7 @@ def _reset_metrics():
 # ---------------------------------------------------------------------------
 # 1. Interrupted / partial manifest write
 # ---------------------------------------------------------------------------
-def test_partial_manifest_write_is_rejected_and_next_commit_recovers(tmp_path):
+def test_partial_manifest_write_is_rejected_and_next_commit_requires_operator_action(tmp_path):
     store = SessionArchiveStore(tmp_path)
     model = "m"
     session = "s"
@@ -78,7 +78,13 @@ def test_partial_manifest_write_is_rejected_and_next_commit_recovers(tmp_path):
     with pytest.raises(SessionArchiveError, match="malformed manifest"):
         store.load(model, session)
 
-    # A subsequent clean commit must atomically replace the bad file.
+    # Trust policy: do not silently repair or overwrite a malformed
+    # manifest on the next commit. The operator must intervene first.
+    with pytest.raises(SessionArchiveError, match="malformed manifest"):
+        store.commit(model, session, [_h("a"), _h("b")])
+
+    # Once the bad file is explicitly removed, a fresh commit succeeds.
+    manifest.unlink()
     store.commit(model, session, [_h("a"), _h("b")])
     assert store.load(model, session) == [_h("a"), _h("b")]
 

@@ -460,3 +460,180 @@ def test_cli_import_and_inspect_bundle_surface_provenance(tmp_path):
     assert import_res.returncode == 0, import_res.stderr
     assert "conflict_policy\tfail" in import_res.stdout
     assert "source_label\tRefactor parser" in import_res.stdout
+
+
+def test_commit_refuses_silent_repair_of_malformed_manifest(tmp_path):
+    root = tmp_path / "archive"
+    store = SessionArchiveStore(root)
+    store.commit("m", "ws-1", [_h("a")])
+    path = store.manifest_path("m", "ws-1")
+    path.write_text("{not json", encoding="utf-8")
+    with pytest.raises(SessionArchiveError, match="malformed manifest"):
+        store.commit("m", "ws-1", [_h("b")])
+
+
+def test_duplicate_turn_ids_and_out_of_order_history_are_rejected(tmp_path):
+    root = tmp_path / "archive"
+    store = SessionArchiveStore(root)
+    store.commit("m", "ws-1", [_h("a")])
+    path = store.manifest_path("m", "ws-1")
+    doc = json.loads(path.read_text("utf-8"))
+    doc["turns"] = [
+        {
+            "turn_id": "t-00002",
+            "committed_at": 2.0,
+            "block_hashes": [_h("a").hex()],
+            "note": "late first",
+        },
+        {
+            "turn_id": "t-00002",
+            "committed_at": 1.0,
+            "block_hashes": [_h("b").hex()],
+            "note": "duplicate id",
+        },
+    ]
+    doc["head_turn_id"] = "t-00002"
+    path.write_text(json.dumps(doc), encoding="utf-8")
+    with pytest.raises(SessionArchiveError, match="duplicate turn_id|out-of-order"):
+        store.load_raw("m", "ws-1")
+
+
+def test_parent_reference_to_missing_turn_is_invalid(tmp_path):
+    root = tmp_path / "archive"
+    store = SessionArchiveStore(root)
+    store.commit("m", "root", [_h("a")])
+    store.fork("m", "root", "branch")
+    path = store.manifest_path("m", "branch")
+    doc = json.loads(path.read_text("utf-8"))
+    doc["parent"] = {"session_id": "root", "turn_id": "t-99999"}
+    path.write_text(json.dumps(doc), encoding="utf-8")
+    with pytest.raises(SessionArchiveError, match="missing parent turn"):
+        store.lineage("m", "branch")
+
+
+def test_resume_rejects_invalid_and_incompatible(tmp_path):
+    root = tmp_path / "archive"
+    store = SessionArchiveStore(root)
+    store.commit("m", "ws-1", [_h("a")])
+
+    invalid = _run(
+        "--archive-root", str(root),
+        "resume", "--model-name", "m", "--session-id", "ghost",
+    )
+    assert invalid.returncode == 1
+
+    incompatible = _run(
+        "--archive-root", str(root),
+        "resume", "--model-name", "m", "--session-id", "ws-1",
+        "--expected-model-name", "other-model",
+    )
+    assert incompatible.returncode == 1
+    assert "grade\tincompatible_model" in incompatible.stdout
+
+
+def test_overwrite_replaces_existing_session_dir_and_no_payload_leaks(tmp_path):
+    from omlx.cache.session_archive_portable import export_session, import_session
+
+    src_archive = tmp_path / "src"
+    src_ssd = tmp_path / "src_ssd"
+    src_ssd.mkdir()
+    store = SessionArchiveStore(src_archive)
+    payload = b"payload-3"
+    h = hashlib.sha256(payload).digest()
+    hp = src_ssd / h.hex()[0] / f"{h.hex()}.safetensors"
+    hp.parent.mkdir(parents=True, exist_ok=True)
+    hp.write_bytes(payload)
+    store.commit("m", "ws-1", [h], label="fresh")
+    bundle = tmp_path / "bundle.tar"
+    export_session(store, "m", "ws-1", src_ssd, bundle)
+
+    dst_archive = tmp_path / "dst"
+    dst_store = SessionArchiveStore(dst_archive)
+    dst_store.commit("m", "ws-1", [_h("old")], label="old")
+    stale_file = dst_store.manifest_path("m", "ws-1").parent / "stale.txt"
+    stale_file.write_text("stale", encoding="utf-8")
+
+    res = import_session(
+        dst_store, bundle, tmp_path / "dst_ssd", overwrite_session=True,
+    )
+    assert res.conflict_policy == "overwrite"
+    assert not stale_file.exists()
+    assert list(dst_archive.rglob("*.safetensors")) == []
+
+
+def test_dangling_imported_lineage_is_visible_in_status(tmp_path):
+    from omlx.cache.session_archive_portable import export_session, import_session
+
+    src_archive = tmp_path / "src"
+    src_ssd = tmp_path / "src_ssd"
+    src_ssd.mkdir()
+    store = SessionArchiveStore(src_archive)
+    payload = b"payload-4"
+    h = hashlib.sha256(payload).digest()
+    hp = src_ssd / h.hex()[0] / f"{h.hex()}.safetensors"
+    hp.parent.mkdir(parents=True, exist_ok=True)
+    hp.write_bytes(payload)
+    store.commit("m", "root", [h], label="root")
+    store.fork("m", "root", "branch", branch_reason="portable handoff")
+    bundle = tmp_path / "branch.tar"
+    export_session(store, "m", "branch", src_ssd, bundle)
+
+    dst_archive = tmp_path / "dst"
+    dst_store = SessionArchiveStore(dst_archive)
+    import_session(dst_store, bundle, tmp_path / "dst_ssd")
+
+    status = _run(
+        "--archive-root", str(dst_archive),
+        "status", "--model-name", "m", "--session-id", "branch",
+    )
+    assert status.returncode == 0, status.stderr
+    assert "parent_status\tdangling" in status.stdout
+    assert "branch_origin\troot@t-00001" in status.stdout
+
+
+def test_normal_workspace_ops_stay_metadata_only(tmp_path):
+    root = tmp_path / "archive"
+    store = SessionArchiveStore(root)
+    store.init_workspace("m", "alpha", label="A")
+    store.commit("m", "alpha", [_h("a")], note="checkpoint")
+    store.fork("m", "alpha", "beta", branch_reason="risk split")
+    _run("--archive-root", str(root), "status", "--model-name", "m", "--session-id", "alpha")
+    _run("--archive-root", str(root), "diff", "--model-a", "m", "--session-a", "alpha", "--model-b", "m", "--session-b", "beta")
+    assert list(root.rglob("*.safetensors")) == []
+    assert list(root.rglob("*.tar")) == []
+
+
+def test_import_rejects_unknown_bundle_layout(tmp_path):
+    import tarfile
+
+    from omlx.cache.session_archive_portable import BundleError, export_session, import_session
+
+    src_archive = tmp_path / "src"
+    ssd = tmp_path / "ssd"
+    ssd.mkdir()
+    store = SessionArchiveStore(src_archive)
+    payload = b"payload-5"
+    h = hashlib.sha256(payload).digest()
+    hp = ssd / h.hex()[0] / f"{h.hex()}.safetensors"
+    hp.parent.mkdir(parents=True, exist_ok=True)
+    hp.write_bytes(payload)
+    store.commit("m", "ws-1", [h])
+    bundle = tmp_path / "bundle.tar"
+    export_session(store, "m", "ws-1", ssd, bundle)
+
+    work = tmp_path / "rewrite"
+    work.mkdir()
+    with tarfile.open(bundle, "r") as tar:
+        tar.extractall(work)
+    bundle_json = work / "bundle.json"
+    data = json.loads(bundle_json.read_text("utf-8"))
+    data["source_cache_layout"] = "unknown-layout/v9"
+    bundle_json.write_text(json.dumps(data), encoding="utf-8")
+    broken = tmp_path / "broken.tar"
+    with tarfile.open(broken, "w") as tar:
+        tar.add(work / "bundle.json", arcname="bundle.json")
+        tar.add(work / "manifest.json", arcname="manifest.json")
+        tar.add(work / "blocks", arcname="blocks")
+
+    with pytest.raises(BundleError, match="source_cache_layout mismatch"):
+        import_session(SessionArchiveStore(tmp_path / "dst"), broken, tmp_path / "dst_ssd")
