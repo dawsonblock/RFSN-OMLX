@@ -475,7 +475,15 @@ class SessionArchiveStore:
                 f"is missing turns list"
             )
         head_id = doc.get("head_turn_id")
-        head = next((t for t in turns if t.get("turn_id") == head_id), turns[-1])
+        head = next((t for t in turns if t.get("turn_id") == head_id), None)
+        if head is None:
+            # A head_turn_id that does not resolve to any recorded turn
+            # is a structural error — refuse to silently serve a
+            # different turn's blocks.
+            raise SessionArchiveError(
+                f"malformed manifest: head_turn_id={head_id!r} for "
+                f"session_id={session_id!r} does not match any recorded turn"
+            )
         hashes_raw = head.get("block_hashes")
         if not isinstance(hashes_raw, list):
             raise SessionArchiveError(
@@ -713,11 +721,17 @@ def replay_check(
     has_block: "callable",
     *,
     turn_id: Optional[str] = None,
+    expected_model_name: Optional[str] = None,
 ) -> ReplayReport:
     """Validate that every block referenced by the chosen turn (default:
     head) is still present in the paged SSD cache. ``has_block`` is a
     callable ``(block_hash_bytes) -> bool`` — typically
     ``PagedSSDCacheManager.has_block``. No tensor bytes are touched.
+
+    When ``expected_model_name`` is provided and does not match the
+    manifest's ``model_name``, the report is graded
+    ``incompatible_model`` and ``replayable=False`` without probing the
+    SSD cache.
     """
     try:
         doc = store.load_raw(model_name, session_id)
@@ -736,6 +750,18 @@ def replay_check(
                 or "compatibility" in str(exc).lower()
                 else INTEGRITY_UNREADABLE
             ),
+        )
+
+    if expected_model_name and doc.get("model_name") != expected_model_name:
+        return ReplayReport(
+            session_id=session_id,
+            model_name=model_name,
+            head_turn_id=str(doc.get("head_turn_id") or ""),
+            total_blocks=0,
+            present_blocks=0,
+            missing_blocks=[],
+            replayable=False,
+            grade=INTEGRITY_INCOMPATIBLE_MODEL,
         )
 
     tid = turn_id or str(doc.get("head_turn_id") or "")

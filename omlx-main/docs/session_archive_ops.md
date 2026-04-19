@@ -175,7 +175,7 @@ KV payload bytes.
 | `lineage --model-name M --session-id S` | Session metadata + parent link + turn count + model_compat. |
 | `fork --model-name M --src-session-id SRC --dst-session-id DST --at-turn t-0000N [--label L] [--description D]` | Create a branch session seeded from SRC@turn. Refuses if DST already exists or the source turn is unknown. |
 | `diff --model-a MA --session-a SA --model-b MB --session-b SB` | Per-turn diff between two sessions. Shows common prefix, common ancestor (when both sessions share a fork point), and per-turn `a_blocks`/`b_blocks`/`common_prefix`/`diverged`. |
-| `replay-check --model-name M --session-id S [--turn t-0000N]` | Walk a turn's block list and report every hash that is not in the SSD cache. Metadata-only — does not load payloads. |
+| `replay-check --model-name M --session-id S [--turn t-0000N]` | Walk a turn's block list and report every hash that is not in the SSD cache. Metadata-only — does not load payloads. Accepts an `expected_model_name` at the Python layer to grade `incompatible_model` without probing the SSD cache. |
 | `export-session --model-name M --session-id S --out BUNDLE.tar [--allow-missing-blocks]` | Write an integrity-verified tarball (`bundle.json` + `manifest.json` + `blocks/<hex>.safetensors`). SHA-256 recorded for every block. Refuses missing blocks unless `--allow-missing-blocks` is passed, in which case the grade degrades to `partially_exportable`. |
 | `import-session --bundle BUNDLE.tar [--expected-model-name M] [--overwrite-session]` | Restore a bundle into `<archive-root>` and `<ssd-cache-dir>`. Verifies every block's SHA-256, rejects path-traversal/symlinks, requires explicit `--overwrite-session` to clobber an existing manifest. |
 
@@ -229,3 +229,6 @@ hardlinks, device/FIFO entries, and files outside `blocks/`.
 - Fork, diff, replay-check, export, and import are **operator-only**
   commands. They are not wired into the scheduler or the HTTP API and
   are not intended to be.
+- The store fails loud on structural drift: a `head_turn_id` that does
+  not resolve to any recorded turn raises `SessionArchiveError` rather
+  than silently falling back to the last turn on disk.
