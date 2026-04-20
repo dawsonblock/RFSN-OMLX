@@ -2,6 +2,7 @@
 
 > One seam only. One authoritative path. No fake replacement claims.
 > Status: landed — pre-chunk prefill gate and per-chunk metrics in place.
+> The third seam (EOS stop detection) was taken in Pass 3 — see `executor_seam_pass3_target.md`.
 
 ## Chosen seam
 

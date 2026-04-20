@@ -1,6 +1,7 @@
 # Next Executor Seam Assessment
 
-> Status: second real executor-seam ownership pass — landed.
+> Status: second real executor-seam ownership pass — landed.  A third pass
+> followed — see `executor_seam_pass3_assessment.md`.
 >
 > Scope: take ownership of the per-chunk prefill step boundary, mirroring
 > the decode-side seam already established in the first pass.

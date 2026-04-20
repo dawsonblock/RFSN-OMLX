@@ -80,7 +80,7 @@ Still delegated for now:
 - sequence-state internals in the stock generation stack,
 - decode-side KV cache mutation internals below the scheduler seam.
 
-The second executor-seam pass took the pre-chunk prefill step gate — see `next_executor_seam_assessment.md`.
+The second executor-seam pass took the pre-chunk prefill step gate — see `next_executor_seam_assessment.md`.  The third pass took the decode-side EOS stop detection gate — see `executor_seam_pass3_assessment.md`.
 
 That is why this is a real ownership gain without pretending the entire runtime is already replaced.
 
