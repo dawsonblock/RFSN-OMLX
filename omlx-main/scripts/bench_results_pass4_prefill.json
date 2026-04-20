@@ -1,0 +1,72 @@
+{
+  "note": "Pass 4 prefill-seam benchmark. Measures BRANCH-OWNED orchestration overhead with stock forward replaced by a no-op spy. Does NOT compare stock-vs-owned (no such toggle exists on the prefill path).",
+  "python": "Python 3.9.7",
+  "mlx_lm_pin": "\"mlx-lm @ git+https://github.com/ml-explore/mlx-lm@dcbf6e33d135a1b7c6767ca0fe7ebbd23df814a7\",",
+  "results": [
+    {
+      "n_tokens": 4096,
+      "prefill_step_size": 256,
+      "chunks": 16,
+      "model_call_count_after_warm": 16,
+      "repeats": 30,
+      "mean_s": 0.002464316732948646,
+      "median_s": 0.0023525209981016815,
+      "stdev_s": 0.000424981092645024,
+      "min_s": 0.0020488330046646297,
+      "max_s": 0.004461208009161055,
+      "mean_per_chunk_s": 0.00015401979580929038
+    },
+    {
+      "n_tokens": 4096,
+      "prefill_step_size": 512,
+      "chunks": 8,
+      "model_call_count_after_warm": 8,
+      "repeats": 30,
+      "mean_s": 0.0011931374998918425,
+      "median_s": 0.0011482709960546345,
+      "stdev_s": 0.0001369797266129168,
+      "min_s": 0.0010850420221686363,
+      "max_s": 0.001766791014233604,
+      "mean_per_chunk_s": 0.0001491421874864803
+    },
+    {
+      "n_tokens": 4096,
+      "prefill_step_size": 1024,
+      "chunks": 4,
+      "model_call_count_after_warm": 4,
+      "repeats": 30,
+      "mean_s": 0.0006606861007943128,
+      "median_s": 0.0006318959931377321,
+      "stdev_s": 7.756079431972212e-05,
+      "min_s": 0.0005660000024363399,
+      "max_s": 0.0009282079990953207,
+      "mean_per_chunk_s": 0.0001651715251985782
+    },
+    {
+      "n_tokens": 4096,
+      "prefill_step_size": 2048,
+      "chunks": 2,
+      "model_call_count_after_warm": 2,
+      "repeats": 30,
+      "mean_s": 0.00036769716631776344,
+      "median_s": 0.00036204200296197087,
+      "stdev_s": 6.176637277766401e-05,
+      "min_s": 0.00031145798857323825,
+      "max_s": 0.0005971250066068023,
+      "mean_per_chunk_s": 0.00018384858315888172
+    },
+    {
+      "n_tokens": 4096,
+      "prefill_step_size": 4096,
+      "chunks": 1,
+      "model_call_count_after_warm": 1,
+      "repeats": 30,
+      "mean_s": 0.0007826417325607812,
+      "median_s": 0.00021439598640426993,
+      "stdev_s": 0.003005321453389089,
+      "min_s": 0.00019758299458771944,
+      "max_s": 0.016692500008502975,
+      "mean_per_chunk_s": 0.0007826417325607812
+    }
+  ]
+}
