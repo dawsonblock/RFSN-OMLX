@@ -145,6 +145,8 @@ class RuntimeMetricsRecorder:
         self._executor_response_count: int = 0
         self._executor_cancel_suppressed: int = 0
         self._executor_finish_overrides: int = 0
+        self._prefill_chunks_completed: int = 0
+        self._prefill_chunks_aborted: int = 0
 
     def admit_request(
         self,
@@ -266,6 +268,15 @@ class RuntimeMetricsRecorder:
         if len(self._completed) > self.max_completed:
             self._completed = self._completed[-self.max_completed :]
 
+    def mark_prefill_chunk(self, request_id: str, *, aborted: bool) -> None:
+        """Record one prefill chunk step (completed or pre-aborted)."""
+        if not self.enabled:
+            return
+        if aborted:
+            self._prefill_chunks_aborted += 1
+        else:
+            self._prefill_chunks_completed += 1
+
     def note_executor_boundary_mode(self, mode: str) -> None:
         self._executor_boundary_mode = str(mode or "unknown")
 
@@ -312,6 +323,8 @@ class RuntimeMetricsRecorder:
             "executor_responses": self._executor_response_count,
             "executor_cancel_suppressed": self._executor_cancel_suppressed,
             "executor_finish_overrides": self._executor_finish_overrides,
+            "prefill_chunks_completed": self._prefill_chunks_completed,
+            "prefill_chunks_aborted": self._prefill_chunks_aborted,
             "requests_tracked": len(self._active) + len(self._completed),
             "completed_requests": len(self._completed),
             "peak_batch_size": self._peak_batch_size,
@@ -348,3 +361,5 @@ class RuntimeMetricsRecorder:
         self._executor_response_count = 0
         self._executor_cancel_suppressed = 0
         self._executor_finish_overrides = 0
+        self._prefill_chunks_completed = 0
+        self._prefill_chunks_aborted = 0

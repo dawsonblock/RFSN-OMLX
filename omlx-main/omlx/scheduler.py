@@ -1136,6 +1136,60 @@ class Scheduler:
                 f"cache layers to {bits}-bit{skip_msg}"
             )
 
+    def _run_owned_prefill_step(
+        self,
+        request: "Request",
+        chunk: "mx.array",
+        prompt_cache: List[Any],
+        *,
+        model_kwargs: Dict[str, Any],
+        uid: Optional[int],
+        processed_tokens: int,
+    ) -> None:
+        """Own one prefill chunk: pre-check for abort, run model forward, record step.
+
+        This is the branch-owned seam for prefill chunk execution.  It mirrors
+        ``_run_owned_decode_step`` on the decode side: the branch checks for a
+        pending abort **before** spending compute on the forward pass.  If an
+        abort is already registered the model call is skipped entirely, which is
+        the key observable difference from the previous inline approach where the
+        abort was only detected *after* ``mx.eval`` completed.
+
+        Args:
+            request: The request being prefilled.
+            chunk: The token-slice array to process (shape ``[1, n]``).
+            prompt_cache: Per-layer KV-cache list mutated in place by the model.
+            model_kwargs: Extra keyword arguments forwarded to the model call
+                          (e.g. ``inputs_embeds``, ``vlm_extra_kwargs``).
+            uid: Batch-generator UID for this request, or ``None`` when not yet
+                 assigned (abort checks are skipped if ``uid`` is ``None``).
+            processed_tokens: Token count processed so far (used in the error
+                              payload if we abort).
+
+        Raises:
+            _PrefillAbortedError: If a pending abort is detected before the
+                                  chunk runs.  The model forward is **not**
+                                  called in this case.
+        """
+        # Pre-chunk abort gate: detect abort before spending compute.
+        abort_uids = self._check_pending_aborts_for_uids(
+            [uid] if uid is not None else []
+        )
+        if abort_uids:
+            self.runtime_metrics.mark_prefill_chunk(
+                request.request_id, aborted=True
+            )
+            raise _PrefillAbortedError(abort_uids, processed_tokens)
+
+        # Run the model forward for this chunk (delegated to MLX).
+        self.model(chunk, cache=prompt_cache, **model_kwargs)
+        mx.eval([c.state for c in prompt_cache])
+
+        # Record step ownership.
+        self.runtime_metrics.mark_prefill_chunk(
+            request.request_id, aborted=False
+        )
+
     def _do_external_prefill(
         self,
         request: "Request",
@@ -1274,10 +1328,14 @@ class Scheduler:
                         extra_kwargs, n_to_process
                     )
 
-            self.model(
-                input_arr[:, :n_to_process], cache=prompt_cache, **model_kwargs
+            self._run_owned_prefill_step(
+                request,
+                input_arr[:, :n_to_process],
+                prompt_cache,
+                model_kwargs=model_kwargs,
+                uid=uid,
+                processed_tokens=processed_tokens,
             )
-            mx.eval([c.state for c in prompt_cache])
 
             input_arr = input_arr[:, n_to_process:]
             if embeds_array is not None:
@@ -1328,18 +1386,6 @@ class Scheduler:
                         f"(hard limit: "
                         f"{self._memory_hard_limit_bytes / 1024**3:.1f}GB)"
                     )
-
-            # Check for pending aborts between prefill chunks.
-            abort_uids = self._check_pending_aborts_for_uids(
-                [uid] if uid is not None else []
-            )
-            if abort_uids:
-                logger.info(
-                    f"Prefill interrupted at {processed_tokens}/"
-                    f"{total_length} tokens: "
-                    f"{len(abort_uids)} request(s) aborted"
-                )
-                raise _PrefillAbortedError(abort_uids, processed_tokens)
 
             # Reclaim Metal intermediates between prefill chunks.
             _sync_and_clear_cache()

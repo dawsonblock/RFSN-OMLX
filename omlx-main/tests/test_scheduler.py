@@ -1952,3 +1952,136 @@ class TestExecutorBoundaryOwnership:
         assert req.request_id in out.finished_request_ids
         assert out.outputs == []
         assert req.request_id not in scheduler.running
+
+
+class TestPrefillSeamOwnership:
+    """Focused tests for the branch-owned prefill chunk step seam."""
+
+    def _make_request(
+        self, *, request_id: str = "req-pf", uid: int = 42
+    ) -> Request:
+        return Request(
+            request_id=request_id,
+            prompt="hi",
+            sampling_params=SamplingParams(max_tokens=4),
+            prompt_token_ids=[1, 2, 3, 4],
+            num_prompt_tokens=4,
+            status=RequestStatus.RUNNING,
+            batch_uid=uid,
+        )
+
+    def test_prefill_seam_records_chunk_on_success(
+        self, mock_model, mock_tokenizer
+    ):
+        """A clean prefill chunk must increment prefill_chunks_completed."""
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        scheduler.runtime_metrics.enabled = True
+        req = self._make_request()
+        scheduler.uid_to_request_id[req.batch_uid] = req.request_id
+        scheduler.runtime_metrics.admit_request(
+            req.request_id, prompt_tokens=4
+        )
+
+        model_mock = MagicMock(return_value=MagicMock())
+        scheduler.model = model_mock
+
+        chunk = mx.array([[1, 2, 3]])
+        scheduler._run_owned_prefill_step(
+            req, chunk, [], model_kwargs={}, uid=req.batch_uid,
+            processed_tokens=0,
+        )
+
+        snap = scheduler.get_runtime_metrics_snapshot()
+        assert snap["prefill_chunks_completed"] == 1
+        assert snap["prefill_chunks_aborted"] == 0
+        model_mock.assert_called_once()
+
+    def test_prefill_seam_pre_abort_skips_model_call(
+        self, mock_model, mock_tokenizer
+    ):
+        """Pre-chunk abort must skip the model forward and raise _PrefillAbortedError."""
+        from omlx.scheduler import _PrefillAbortedError
+
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        scheduler.runtime_metrics.enabled = True
+        req = self._make_request()
+        scheduler.uid_to_request_id[req.batch_uid] = req.request_id
+        scheduler.runtime_metrics.admit_request(
+            req.request_id, prompt_tokens=4
+        )
+        # Register abort BEFORE the step fires.
+        scheduler._pending_abort_ids.add(req.request_id)
+
+        model_mock = MagicMock()
+        scheduler.model = model_mock
+
+        chunk = mx.array([[1, 2, 3]])
+        with pytest.raises(_PrefillAbortedError):
+            scheduler._run_owned_prefill_step(
+                req, chunk, [], model_kwargs={}, uid=req.batch_uid,
+                processed_tokens=0,
+            )
+
+        model_mock.assert_not_called()
+        snap = scheduler.get_runtime_metrics_snapshot()
+        assert snap["prefill_chunks_aborted"] == 1
+        assert snap["prefill_chunks_completed"] == 0
+
+    def test_prefill_seam_abort_mid_multi_chunk(
+        self, mock_model, mock_tokenizer
+    ):
+        """Abort registered after chunk 1 must be caught by the pre-check of chunk 2."""
+        from omlx.scheduler import _PrefillAbortedError
+
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        scheduler.runtime_metrics.enabled = True
+        req = self._make_request()
+        scheduler.uid_to_request_id[req.batch_uid] = req.request_id
+        scheduler.runtime_metrics.admit_request(
+            req.request_id, prompt_tokens=8
+        )
+
+        call_count = 0
+
+        def forward_side_effect(chunk, cache, **kw):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                # Abort arrives while chunk 1 is running.
+                scheduler._pending_abort_ids.add(req.request_id)
+            return MagicMock()
+
+        scheduler.model = MagicMock(side_effect=forward_side_effect)
+
+        chunk = mx.array([[1, 2, 3]])
+
+        # Chunk 1: no abort yet at pre-check time — runs successfully.
+        scheduler._run_owned_prefill_step(
+            req, chunk, [], model_kwargs={}, uid=req.batch_uid,
+            processed_tokens=0,
+        )
+
+        # Chunk 2: abort was registered during chunk 1 — pre-check fires.
+        with pytest.raises(_PrefillAbortedError):
+            scheduler._run_owned_prefill_step(
+                req, chunk, [], model_kwargs={}, uid=req.batch_uid,
+                processed_tokens=3,
+            )
+
+        snap = scheduler.get_runtime_metrics_snapshot()
+        assert snap["prefill_chunks_completed"] == 1
+        assert snap["prefill_chunks_aborted"] == 1
+        assert call_count == 1  # model called only for chunk 1
+
+    def test_runtime_metrics_snapshot_reports_prefill_chunk_counts(
+        self, mock_model, mock_tokenizer
+    ):
+        """snapshot() must expose prefill_chunks_completed and prefill_chunks_aborted."""
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        scheduler.runtime_metrics.enabled = True
+
+        snap = scheduler.get_runtime_metrics_snapshot()
+        assert "prefill_chunks_completed" in snap
+        assert "prefill_chunks_aborted" in snap
+        assert snap["prefill_chunks_completed"] == 0
+        assert snap["prefill_chunks_aborted"] == 0
