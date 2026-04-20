@@ -68,4 +68,4 @@ Ownership is proven by:
 
 Keep the owned seam.
 
-If work continues, the next seam should only be taken if it increases real authority again without forcing a much larger rewrite.
+The next seam (pre-chunk prefill step gate) was taken in the second executor-seam pass — see `next_executor_seam_target.md`. It added pre-chunk abort gating and per-chunk prefill metrics without requiring a broader rewrite.

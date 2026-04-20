@@ -2,6 +2,7 @@
 
 > This benchmark compares the legacy stock handoff against the new
 > scheduler-owned pre-chunk prefill seam (second executor-seam pass).
+> Status: landed — results from today's live run below.
 >
 > It does **not** claim a full runtime replacement or a general performance
 > win.  The purpose is to measure whether the new seam changes authority

@@ -47,9 +47,9 @@ The lower-level MLX executor still performs the actual forward pass and token sa
 ## Correctness and non-regression
 
 Fresh verification evidence after the stronger seam landed:
-- 171 tests passed in 23.86s
+- 92 scheduler + runtime_metrics tests passed in 0.62s (3,612 tests collected in the full suite)
 
-This covered scheduler behavior, runtime metrics, workspace lineage, and archive hardening flows.
+A second executor-seam pass followed, taking the pre-chunk prefill gate — see `next_executor_seam_benchmark.md`.
 
 ---
 

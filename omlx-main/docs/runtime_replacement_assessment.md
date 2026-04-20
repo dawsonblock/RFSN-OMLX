@@ -30,6 +30,8 @@ However, the actual decode/prefill execution loop is still structurally anchored
 | Scheduling queue | `Scheduler.waiting`, `Scheduler.running`, `Scheduler.step()` | `omlx/scheduler.py` | Replaceable in-place |
 | Continuous batching | `mlx_lm.generate.BatchGenerator` via the scheduler | `omlx/scheduler.py` | **Hard blocker** |
 | Prompt/decode stepping | `BatchGenerator.next_generated()` plus MLX model calls | `omlx/scheduler.py` | **Hard blocker** |
+| Decode-step boundary | `_run_owned_decode_step` in scheduler | `omlx/scheduler.py` | Branch-owned seam (first executor-seam pass) |
+| Pre-chunk prefill gate | `_run_owned_prefill_step` in scheduler | `omlx/scheduler.py` | Branch-owned seam (second executor-seam pass) |
 | Block metadata / residency | `PagedCacheManager` | `omlx/cache/paged_cache.py` | Replaceable with care |
 | SSD spill/persisted KV bytes | `PagedSSDCacheManager` | `omlx/cache/paged_ssd_cache.py` | Replaceable with care |
 | Prefix reuse policy | `BlockAwarePrefixCache` | `omlx/cache/prefix_cache.py` | Replaceable in-place |
@@ -94,8 +96,10 @@ Those should remain clearly subordinate to the runtime spine, not peers of it.
 
 1. **Decode-loop ownership is external**
    - The scheduler still depends on `mlx_lm.generate.BatchGenerator` for generation stepping.
+   - *Partial progress: a decode-step entry seam was taken in the first executor-seam pass (`_run_owned_decode_step`). The loop itself remains delegated.*
 2. **Prefill semantics are intertwined with MLX patching**
    - Grammar, mRoPE, boundary snapshots, and special cache behavior are patched around the current executor.
+   - *Partial progress: a pre-chunk prefill gate was taken in the second executor-seam pass (`_run_owned_prefill_step`). Model forward execution remains delegated.*
 3. **Cache authority is split across multiple layers**
    - `BlockAwarePrefixCache`, `PagedCacheManager`, and `PagedSSDCacheManager` each own part of the truth.
 4. **No single runtime truth surface existed until this pass**

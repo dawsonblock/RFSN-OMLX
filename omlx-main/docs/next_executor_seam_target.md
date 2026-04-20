@@ -1,6 +1,7 @@
 # Next Executor Seam Target
 
 > One seam only. One authoritative path. No fake replacement claims.
+> Status: landed — pre-chunk prefill gate and per-chunk metrics in place.
 
 ## Chosen seam
 

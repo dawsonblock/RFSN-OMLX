@@ -1,6 +1,6 @@
 # Executor Seam Assessment
 
-> Status: first real executor-seam ownership pass.
+> Status: first real executor-seam ownership pass. A second pass followed — see `next_executor_seam_assessment.md`.
 >
 > Scope: identify the exact stock handoff, record current ownership, and pin down the smallest clean seam the branch can truly own.
 
@@ -55,6 +55,8 @@ These were the concrete places where control left branch-owned code.
 | Low-level model forward pass | delegated | still handled by the stock MLX execution path |
 | Token sampling math | delegated | still inside the stock generation stack |
 | Decode-side cache mutation internals | delegated for now | still below the owned seam |
+| Pre-chunk prefill abort gating | branch-owned seam | added in second executor-seam pass; abort check runs before model forward |
+| Per-chunk prefill step counters | branch-owned seam | added in second executor-seam pass; mark_prefill_chunk in RuntimeMetricsRecorder |
 
 ---
 
@@ -77,6 +79,8 @@ Still delegated for now:
 - token sampling and logits handling,
 - sequence-state internals in the stock generation stack,
 - decode-side KV cache mutation internals below the scheduler seam.
+
+The second executor-seam pass took the pre-chunk prefill step gate — see `next_executor_seam_assessment.md`.
 
 That is why this is a real ownership gain without pretending the entire runtime is already replaced.
 
