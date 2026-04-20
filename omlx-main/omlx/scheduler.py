@@ -374,6 +374,7 @@ class _ExecutorStepOutcome:
     finished_request_ids: Set[str] = field(default_factory=set)
     suppressed_request_ids: Set[str] = field(default_factory=set)
     finish_overrides: int = 0
+    stop_overrides: int = 0
 
 
 class _BoundarySnapshotProvider:
@@ -3934,6 +3935,7 @@ class Scheduler:
                 response_count=0,
                 suppressed_count=len(outcome.suppressed_request_ids),
                 finish_overrides=outcome.finish_overrides,
+                stop_overrides=outcome.stop_overrides,
             )
             return outcome
 
@@ -3951,6 +3953,19 @@ class Scheduler:
                 continue
 
             finish_reason = getattr(response, "finish_reason", None)
+
+            # Pass 3: scheduler-owned EOS stop detection.
+            # When stock hasn't flagged finish_reason yet, check the emitted
+            # token against the branch-held EOS set so the branch claims
+            # authority over stop decisions rather than depending solely on
+            # BatchGenerator to set finish_reason="stop".
+            if finish_reason is None:
+                token_id = getattr(response, "token", None)
+                if token_id is not None and token_id in self._get_stop_tokens():
+                    response = self._clone_response_with_finish_reason(response, "stop")
+                    finish_reason = "stop"
+                    outcome.stop_overrides += 1
+
             max_tokens = int(getattr(request.sampling_params, "max_tokens", 0) or 0)
             if finish_reason is None and max_tokens > 0:
                 next_completion_tokens = request.num_output_tokens + 1
@@ -3971,6 +3986,7 @@ class Scheduler:
             response_count=len(outcome.responses),
             suppressed_count=len(outcome.suppressed_request_ids),
             finish_overrides=outcome.finish_overrides,
+            stop_overrides=outcome.stop_overrides,
         )
         return outcome
 

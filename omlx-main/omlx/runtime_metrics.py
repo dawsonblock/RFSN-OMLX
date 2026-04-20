@@ -145,6 +145,7 @@ class RuntimeMetricsRecorder:
         self._executor_response_count: int = 0
         self._executor_cancel_suppressed: int = 0
         self._executor_finish_overrides: int = 0
+        self._executor_stop_overrides: int = 0
         self._prefill_chunks_completed: int = 0
         self._prefill_chunks_aborted: int = 0
 
@@ -287,6 +288,7 @@ class RuntimeMetricsRecorder:
         response_count: int,
         suppressed_count: int = 0,
         finish_overrides: int = 0,
+        stop_overrides: int = 0,
     ) -> None:
         self.note_executor_boundary_mode(mode)
         if not self.enabled:
@@ -295,6 +297,7 @@ class RuntimeMetricsRecorder:
         self._executor_response_count += int(response_count or 0)
         self._executor_cancel_suppressed += int(suppressed_count or 0)
         self._executor_finish_overrides += int(finish_overrides or 0)
+        self._executor_stop_overrides += int(stop_overrides or 0)
 
     def get_request_snapshot(self, request_id: str) -> Optional[Dict[str, Any]]:
         trace = self._active.get(request_id)
@@ -323,6 +326,7 @@ class RuntimeMetricsRecorder:
             "executor_responses": self._executor_response_count,
             "executor_cancel_suppressed": self._executor_cancel_suppressed,
             "executor_finish_overrides": self._executor_finish_overrides,
+            "executor_stop_overrides": self._executor_stop_overrides,
             "prefill_chunks_completed": self._prefill_chunks_completed,
             "prefill_chunks_aborted": self._prefill_chunks_aborted,
             "requests_tracked": len(self._active) + len(self._completed),
@@ -361,5 +365,6 @@ class RuntimeMetricsRecorder:
         self._executor_response_count = 0
         self._executor_cancel_suppressed = 0
         self._executor_finish_overrides = 0
+        self._executor_stop_overrides = 0
         self._prefill_chunks_completed = 0
         self._prefill_chunks_aborted = 0

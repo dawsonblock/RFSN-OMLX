@@ -2085,3 +2085,107 @@ class TestPrefillSeamOwnership:
         assert "prefill_chunks_aborted" in snap
         assert snap["prefill_chunks_completed"] == 0
         assert snap["prefill_chunks_aborted"] == 0
+
+
+class TestEosStopOwnership:
+    """Focused tests for the branch-owned EOS stop detection seam (Pass 3).
+
+    The scheduler must independently detect when a generated token is an EOS
+    token and set finish_reason="stop" without relying solely on BatchGenerator.
+    """
+
+    def _make_running_request(
+        self, *, request_id: str = "req-eos", uid: int = 99, max_tokens: int = 10
+    ) -> Request:
+        return Request(
+            request_id=request_id,
+            prompt="hello",
+            sampling_params=SamplingParams(max_tokens=max_tokens),
+            prompt_token_ids=[1, 2, 3],
+            num_prompt_tokens=3,
+            status=RequestStatus.RUNNING,
+            batch_uid=uid,
+        )
+
+    def _make_scheduler_with_request(self, mock_model, mock_tokenizer, req):
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        scheduler.runtime_metrics.enabled = True
+        scheduler._get_detokenizer = MagicMock(return_value=None)
+        scheduler.running[req.request_id] = req
+        scheduler.requests[req.request_id] = req
+        scheduler.request_id_to_uid[req.request_id] = req.batch_uid
+        scheduler.uid_to_request_id[req.batch_uid] = req.request_id
+        return scheduler
+
+    def test_eos_stop_detects_when_stock_silent(
+        self, mock_model, mock_tokenizer
+    ):
+        """Branch must override finish_reason to 'stop' when token is EOS and stock says None."""
+        req = self._make_running_request()
+        scheduler = self._make_scheduler_with_request(mock_model, mock_tokenizer, req)
+
+        # token=2 is MockTokenizer.eos_token_id; finish_reason=None (stock silent)
+        eos_token_id = mock_tokenizer.eos_token_id  # 2
+        response = type(
+            "Resp", (), {"uid": req.batch_uid, "token": eos_token_id, "finish_reason": None}
+        )()
+        scheduler.batch_generator = MagicMock()
+        scheduler.batch_generator.next_generated.return_value = [response]
+
+        out = scheduler.step()
+
+        assert out.outputs
+        assert out.outputs[0].finished is True
+        assert out.outputs[0].finish_reason == "stop"
+        assert req.status == RequestStatus.FINISHED_STOPPED
+
+    def test_non_eos_token_not_overridden(
+        self, mock_model, mock_tokenizer
+    ):
+        """A non-EOS token with finish_reason=None must not be promoted to stop."""
+        req = self._make_running_request(max_tokens=10)
+        scheduler = self._make_scheduler_with_request(mock_model, mock_tokenizer, req)
+
+        # token=99 is not an EOS token; finish_reason=None (still generating)
+        response = type(
+            "Resp", (), {"uid": req.batch_uid, "token": 99, "finish_reason": None}
+        )()
+        scheduler.batch_generator = MagicMock()
+        scheduler.batch_generator.next_generated.return_value = [response]
+
+        out = scheduler.step()
+
+        # Request should still be running, not finished
+        assert all(not o.finished for o in out.outputs)
+
+    def test_eos_stop_does_not_double_override_when_stock_already_set(
+        self, mock_model, mock_tokenizer
+    ):
+        """When stock already sets finish_reason='stop', branch must not increment stop_overrides."""
+        req = self._make_running_request()
+        scheduler = self._make_scheduler_with_request(mock_model, mock_tokenizer, req)
+
+        eos_token_id = mock_tokenizer.eos_token_id  # 2
+        # Stock already set finish_reason="stop" — branch gate only fires when finish_reason is None
+        response = type(
+            "Resp", (), {"uid": req.batch_uid, "token": eos_token_id, "finish_reason": "stop"}
+        )()
+        scheduler.batch_generator = MagicMock()
+        scheduler.batch_generator.next_generated.return_value = [response]
+
+        scheduler.step()
+
+        snap = scheduler.get_runtime_metrics_snapshot()
+        # stop_overrides counter must be 0 — branch didn't need to override
+        assert snap.get("executor_stop_overrides", 0) == 0
+
+    def test_runtime_metrics_snapshot_reports_stop_overrides(
+        self, mock_model, mock_tokenizer
+    ):
+        """snapshot() must expose executor_stop_overrides key."""
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        scheduler.runtime_metrics.enabled = True
+
+        snap = scheduler.get_runtime_metrics_snapshot()
+        assert "executor_stop_overrides" in snap
+        assert snap["executor_stop_overrides"] == 0
