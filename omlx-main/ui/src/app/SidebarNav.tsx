@@ -2,6 +2,7 @@ import { NavLink } from 'react-router-dom';
 
 const items = [
   { to: '/', label: 'Workspaces', end: true },
+  { to: '/models', label: 'Models' },
   { to: '/transfers', label: 'Transfers' },
   { to: '/maintenance', label: 'Maintenance' },
   { to: '/settings', label: 'Settings' },

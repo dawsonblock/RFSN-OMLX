@@ -9,6 +9,7 @@ import DiffPage from './pages/DiffPage';
 import Transfers from './pages/Transfers';
 import Maintenance from './pages/Maintenance';
 import SettingsPage from './pages/SettingsPage';
+import ModelsPage from './pages/ModelsPage';
 
 export default function App() {
   return (
@@ -22,6 +23,7 @@ export default function App() {
         <Route path="/diff" element={<DiffPage />} />
         <Route path="/transfers" element={<Transfers />} />
         <Route path="/maintenance" element={<Maintenance />} />
+        <Route path="/models" element={<ModelsPage />} />
         <Route path="/settings" element={<SettingsPage />} />
       </Routes>
     </AppShell>
