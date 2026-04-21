@@ -1,18 +1,11 @@
-import { useState } from 'react';
-import { useMutation, useQuery } from '@tanstack/react-query';
-import * as api from '../lib/api';
-import { ErrorBox, Empty, Section, formatBytes, formatTs } from '../components/ui';
-import ConfirmModal from '../components/ConfirmModal';
-import type { PrunePlan } from '../lib/schemas';
+import { useMemo, useState } from 'react';
+import { useMaintenanceStats, usePruneDryRun, usePruneExecute } from '../hooks';
+import { ErrorBox, Empty, Section, formatBytes } from '../components/ui';
+import PruneReasonGroup from '../features/maintenance/PruneReasonGroup';
+import DangerConfirmDialog from '../features/maintenance/DangerConfirmDialog';
+import type { PrunePlan } from '../types';
 
-const CLASSES = [
-  'stale',
-  'invalid',
-  'orphaned',
-  'exports',
-  'empty',
-  'unreadable',
-] as const;
+const CLASSES = ['stale', 'invalid', 'orphaned', 'exports', 'empty', 'unreadable'] as const;
 
 export default function Maintenance() {
   const [classes, setClasses] = useState<string[]>([]);
@@ -22,38 +15,42 @@ export default function Maintenance() {
   const [confirmOpen, setConfirmOpen] = useState(false);
   const [execResult, setExecResult] = useState<unknown>(null);
 
-  const stats = useQuery({ queryKey: ['mstats'], queryFn: api.maintenanceStats });
+  const stats = useMaintenanceStats();
+  const dry = usePruneDryRun();
+  const exec = usePruneExecute();
 
-  const dry = useMutation({
-    mutationFn: () =>
-      api.pruneDryRun({
-        classes,
-        model_name: model || null,
-        include_pinned: includePinned,
-      }),
-    onSuccess: (d) => setPlan(d),
-  });
+  const eligible = plan?.candidates.filter((c) => c.action === 'eligible') ?? [];
+  const groups = useMemo(() => {
+    if (!plan) return [] as [string, PrunePlan['candidates']][];
+    return Object.entries(plan.by_reason);
+  }, [plan]);
 
-  const exec = useMutation({
-    mutationFn: () => {
-      if (!plan) throw new Error('no plan to execute');
-      return api.pruneExecute({
+  const runDryRun = () =>
+    dry.mutate(
+      { classes, model_name: model || null, include_pinned: includePinned },
+      { onSuccess: (d) => setPlan(d) },
+    );
+
+  const runExecute = () => {
+    if (!plan) return;
+    exec.mutate(
+      {
         classes,
         model_name: model || null,
         include_pinned: includePinned,
         now: plan.now,
         plan_signature: plan.plan_signature,
         confirm: true,
-      });
-    },
-    onSuccess: (d) => {
-      setExecResult(d);
-      setConfirmOpen(false);
-      setPlan(null);
-    },
-  });
-
-  const eligible = plan?.candidates.filter((c) => c.action === 'eligible') ?? [];
+      },
+      {
+        onSuccess: (d) => {
+          setExecResult(d);
+          setConfirmOpen(false);
+          setPlan(null);
+        },
+      },
+    );
+  };
 
   return (
     <>
@@ -95,7 +92,11 @@ export default function Maintenance() {
           <div className="grid grid-cols-1 gap-3 md:grid-cols-3">
             <div>
               <label className="label">Model (optional)</label>
-              <input className="input" value={model} onChange={(e) => { setModel(e.target.value); setPlan(null); }} />
+              <input
+                className="input"
+                value={model}
+                onChange={(e) => { setModel(e.target.value); setPlan(null); }}
+              />
             </div>
             <label className="flex items-end gap-2 text-sm">
               <input
@@ -110,7 +111,7 @@ export default function Maintenance() {
             <button
               className="btn-primary"
               disabled={classes.length === 0 || dry.isPending}
-              onClick={() => dry.mutate()}
+              onClick={runDryRun}
             >
               Dry-run
             </button>
@@ -131,40 +132,23 @@ export default function Maintenance() {
               <Stat label="Total" value={plan.candidates.length} />
               <Stat label="Eligible" value={eligible.length} />
               <Stat label="Protected" value={plan.candidates.length - eligible.length} />
-              <Stat label="Signature" value={plan.plan_signature.slice(0, 12) + '…'} mono />
+              <Stat
+                label="Signature"
+                value={plan.plan_signature.slice(0, 12) + '…'}
+                mono
+              />
             </div>
             {plan.candidates.length === 0 ? (
               <Empty>No candidates.</Empty>
             ) : (
-              <div className="overflow-x-auto rounded border border-neutral-200">
-                <table className="min-w-full divide-y divide-neutral-200 text-sm">
-                  <thead className="bg-neutral-50 text-left text-xs uppercase text-neutral-500">
-                    <tr>
-                      <th className="px-3 py-2">Kind</th>
-                      <th className="px-3 py-2">Action</th>
-                      <th className="px-3 py-2">Reason</th>
-                      <th className="px-3 py-2">Model / Session</th>
-                      <th className="px-3 py-2">Age</th>
-                      <th className="px-3 py-2">Pinned</th>
-                    </tr>
-                  </thead>
-                  <tbody className="divide-y divide-neutral-100">
-                    {plan.candidates.map((c, i) => (
-                      <tr key={i} className={c.action === 'eligible' ? 'bg-red-50' : ''}>
-                        <td className="px-3 py-2">{c.kind}</td>
-                        <td className="px-3 py-2">{c.action}</td>
-                        <td className="px-3 py-2 font-mono text-xs">{c.reason}</td>
-                        <td className="px-3 py-2 font-mono text-xs">
-                          {c.model_name} / {c.session_id}
-                        </td>
-                        <td className="px-3 py-2 text-xs">
-                          {(c.age_seconds / 86400).toFixed(1)}d
-                        </td>
-                        <td className="px-3 py-2">{c.pinned ? '📌' : '—'}</td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
+              <div className="space-y-2">
+                {groups.map(([reason, candidates]) => (
+                  <PruneReasonGroup
+                    key={reason}
+                    reason={reason}
+                    candidates={candidates}
+                  />
+                ))}
               </div>
             )}
           </div>
@@ -180,29 +164,37 @@ export default function Maintenance() {
       )}
       {exec.error && <ErrorBox error={exec.error} />}
 
-      <ConfirmModal
+      <DangerConfirmDialog
         open={confirmOpen}
         title="Execute prune"
-        destructive
         confirmText="Execute prune"
-        onCancel={() => setConfirmOpen(false)}
-        onConfirm={() => exec.mutate()}
         requireTyping={plan?.plan_signature.slice(0, 6) ?? ''}
+        onCancel={() => setConfirmOpen(false)}
+        onConfirm={runExecute}
       >
         <p>
-          This will permanently delete {eligible.length} eligible item(s). The plan signature
-          <span className="mx-1 font-mono">{plan?.plan_signature.slice(0, 12)}</span>
+          This will permanently delete {eligible.length} eligible item(s). The plan
+          signature{' '}
+          <span className="mx-1 font-mono">
+            {plan?.plan_signature.slice(0, 12)}
+          </span>
           will be re-verified server-side.
         </p>
-        <p className="mt-2">
-          Type the first 6 characters of the signature to confirm.
-        </p>
-      </ConfirmModal>
+        <p className="mt-2">Type the first 6 characters of the signature to confirm.</p>
+      </DangerConfirmDialog>
     </>
   );
 }
 
-function Stat({ label, value, mono }: { label: string; value: string | number; mono?: boolean }) {
+function Stat({
+  label,
+  value,
+  mono,
+}: {
+  label: string;
+  value: string | number;
+  mono?: boolean;
+}) {
   return (
     <div>
       <div className="label">{label}</div>
@@ -210,6 +202,3 @@ function Stat({ label, value, mono }: { label: string; value: string | number; m
     </div>
   );
 }
-
-// Silence formatTs TS6133 when not used (kept for future pages).
-void formatTs;
