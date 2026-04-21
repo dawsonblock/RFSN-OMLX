@@ -124,6 +124,7 @@ cd omlx-main
   tests/test_prefill_seam_pass4.py \
   tests/test_runtime_metrics.py \
   tests/test_non_regression_shared_cache.py \
+  tests/test_pruning_policy.py \
   -x
 ```
 
