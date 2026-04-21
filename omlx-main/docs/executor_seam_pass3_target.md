@@ -83,3 +83,10 @@ require changing the prefill path or cache machinery, and closes a correctness
 gap that users can observe via the API.  Candidate B second (slightly wider,
 requires a string-match loop).  Candidate C is the largest structural change
 and should come last.
+
+
+---
+
+## Historical — superseded
+
+Superseded by [`docs/executor_seam_pass4_final.md`](./executor_seam_pass4_final.md). No further executor seams are planned. For the canonical ownership statement see [`docs/runtime_ownership_table.md`](./runtime_ownership_table.md); for final branch scope see [`docs/final_branch_identity.md`](./final_branch_identity.md).
