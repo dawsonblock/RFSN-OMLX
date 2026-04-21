@@ -1,0 +1,1 @@
+{"root":["./src/app.tsx","./src/main.tsx","./src/components/confirmmodal.tsx","./src/components/ui.tsx","./src/lib/api.ts","./src/lib/schemas.ts","./src/pages/diffpage.tsx","./src/pages/forkpage.tsx","./src/pages/maintenance.tsx","./src/pages/settingspage.tsx","./src/pages/transfers.tsx","./src/pages/workspacedetail.tsx","./src/pages/workspacelist.tsx"],"version":"5.9.3"}

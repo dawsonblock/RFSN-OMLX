@@ -434,6 +434,10 @@ set_admin_getters(
 )
 app.include_router(admin_router)
 
+# Include operator UI bridge routes (local read/compose over the archive).
+from .ui_api import router as ui_api_router
+app.include_router(ui_api_router)
+
 
 @app.exception_handler(_RedirectToLogin)
 async def redirect_to_login_handler(request, exc):
