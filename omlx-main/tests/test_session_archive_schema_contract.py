@@ -229,3 +229,49 @@ def test_bundle_envelope_missing_required_key(
     # message instead, which is still a hard rejection.)
     if missing_key != "bundle_version":
         assert repr(missing_key) in msg or missing_key in msg
+
+
+# --------------------------------------------------------------------------
+# Pass 6: optional operational fields (pinned, last_used_at) are
+# additive and must not be required for a v2 manifest to round-trip.
+# --------------------------------------------------------------------------
+def test_optional_pinned_field_roundtrip(tmp_path: Path) -> None:
+    """`pinned` is optional, defaults to absent/false, survives commit cycles."""
+    store = SessionArchiveStore(tmp_path / "a")
+    store.commit("m", "s", [_h("a")])
+    # A freshly-committed manifest does NOT require the optional field.
+    doc = store.load_raw("m", "s")
+    assert "pinned" not in doc or doc.get("pinned") is False
+    assert store.is_pinned("m", "s") is False
+
+    # Round-trip: set, reload, clear, reload.
+    store.set_pinned("m", "s", True)
+    assert store.load_raw("m", "s").get("pinned") is True
+    assert store.is_pinned("m", "s") is True
+
+    store.set_pinned("m", "s", False)
+    assert store.load_raw("m", "s").get("pinned") is False
+    assert store.is_pinned("m", "s") is False
+
+    # Adding a new turn must preserve the flag (commit() reads-modify-writes).
+    store.commit("m", "s", [_h("a"), _h("b")])
+    # commit() preserves extra keys silently.
+    assert store.load_raw("m", "s").get("pinned") is False
+
+
+def test_optional_last_used_at_field_roundtrip(tmp_path: Path) -> None:
+    """`last_used_at` is optional, defaults to null/absent, touches do not
+    advance ``updated_at``."""
+    store = SessionArchiveStore(tmp_path / "a")
+    store.commit("m", "s", [_h("a")])
+    doc0 = store.load_raw("m", "s")
+    assert doc0.get("last_used_at") in (None, 0)
+    updated_at_before = doc0.get("updated_at")
+
+    ts = store.touch_last_used("m", "s")
+    assert isinstance(ts, float) and ts > 0
+
+    doc1 = store.load_raw("m", "s")
+    assert doc1.get("last_used_at") == ts
+    # touch_last_used does NOT move updated_at.
+    assert doc1.get("updated_at") == updated_at_before

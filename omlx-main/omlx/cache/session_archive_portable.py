@@ -61,7 +61,12 @@ __all__ = [
     "export_session",
     "import_session",
     "inspect_bundle",
+    "iter_bundles",
+    "is_bundle_pinned",
+    "set_bundle_pinned",
+    "bundle_pin_path",
     "BUNDLE_VERSION",
+    "BUNDLE_PIN_SUFFIX",
     "BundleError",
     "ExportResult",
     "ImportResult",
@@ -70,6 +75,7 @@ __all__ = [
 _log = logging.getLogger(__name__)
 
 BUNDLE_VERSION = "1"
+BUNDLE_PIN_SUFFIX = ".pinned"
 _BUNDLE_JSON = "bundle.json"
 _BLOCKS_DIR = "blocks"
 _ENVELOPE_KEYS = (
@@ -343,6 +349,12 @@ def export_session(
             tar.add(work / _BLOCKS_DIR, arcname=_BLOCKS_DIR)
 
     grade = INTEGRITY_PARTIALLY_EXPORTABLE if missing else "healthy"
+    # Pass 6: a successful export is a "use" of the source session —
+    # refresh last_used_at (best-effort; never fail export on this).
+    try:
+        store.touch_last_used(model_name, session_id)
+    except Exception:
+        pass
     return ExportResult(
         path=out,
         block_count=len(present_paths),
@@ -575,6 +587,13 @@ def import_session(
         session_dir.mkdir(parents=True, exist_ok=True)
         store._atomic_write(session_dir, manifest)  # noqa: SLF001
 
+    # Pass 6: a successful import is a "use" of the destination session —
+    # refresh last_used_at so fresh imports aren't immediately stale.
+    try:
+        store.touch_last_used(model_name, session_id)
+    except Exception:
+        pass
+
     return ImportResult(
         model_name=model_name,
         session_id=session_id,
@@ -588,3 +607,81 @@ def import_session(
         re_rooted=bool(re_root_lineage),
         provenance=envelope,
     )
+
+
+# ---------------------------------------------------------------------------
+# Pass 6: bundle discovery + pinning (sidecar marker files).
+#
+# A bundle is considered "pinned" when a sibling file named
+# ``<bundle_path>.pinned`` exists. The marker's contents are not inspected
+# — its presence alone is authoritative — so operators can toggle pins
+# with any filesystem tool. This is deliberately additive and does not
+# modify the bundle tarball itself, preserving its content hash.
+# ---------------------------------------------------------------------------
+_BUNDLE_SUFFIXES = (".omlx-session.tar", ".tar")
+
+
+def bundle_pin_path(bundle_path: Union[str, os.PathLike]) -> Path:
+    """Return the sidecar pin-marker path for a bundle file."""
+    return Path(str(bundle_path) + BUNDLE_PIN_SUFFIX)
+
+
+def is_bundle_pinned(bundle_path: Union[str, os.PathLike]) -> bool:
+    """Return True iff a sidecar ``<bundle>.pinned`` marker exists."""
+    try:
+        return bundle_pin_path(bundle_path).exists()
+    except OSError:
+        return False
+
+
+def set_bundle_pinned(
+    bundle_path: Union[str, os.PathLike], pinned: bool
+) -> bool:
+    """Create or remove the sidecar pin marker. Returns the new state.
+
+    Does not validate that ``bundle_path`` exists — pinning is a marker
+    operation and operators may pre-pin expected targets.
+    """
+    marker = bundle_pin_path(bundle_path)
+    if pinned:
+        try:
+            marker.parent.mkdir(parents=True, exist_ok=True)
+            if not marker.exists():
+                marker.write_text("", encoding="utf-8")
+        except OSError:
+            return is_bundle_pinned(bundle_path)
+        return True
+    try:
+        if marker.exists():
+            marker.unlink()
+    except OSError:
+        pass
+    return is_bundle_pinned(bundle_path)
+
+
+def iter_bundles(
+    bundle_dir: Union[str, os.PathLike],
+) -> Iterable[Path]:
+    """Yield bundle files under ``bundle_dir`` (non-recursive).
+
+    Recognizes ``*.omlx-session.tar`` first, then falls back to ``*.tar``
+    so tests using short filenames continue to work. Does not follow
+    symlinks. Skips sidecar ``.pinned`` markers.
+    """
+    root = Path(bundle_dir)
+    if not root.is_dir():
+        return
+    seen: set = set()
+    for suffix in _BUNDLE_SUFFIXES:
+        for entry in sorted(root.iterdir()):
+            if entry.is_symlink() or not entry.is_file():
+                continue
+            name = entry.name
+            if name.endswith(BUNDLE_PIN_SUFFIX):
+                continue
+            if not name.endswith(suffix):
+                continue
+            if entry in seen:
+                continue
+            seen.add(entry)
+            yield entry

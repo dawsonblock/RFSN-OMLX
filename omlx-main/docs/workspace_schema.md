@@ -101,6 +101,25 @@ them into a single synthetic turn in memory. The next successful
 `commit()` persists the session as v2. v1 export is not supported —
 exports always write v2.
 
+### 2.7 Optional operational fields (additive, non-breaking)
+
+Pass 6 adds two optional top-level fields. Both are strictly additive;
+their absence is equivalent to the default, and both `MANIFEST_VERSION`
+and `SUPPORTED_MANIFEST_VERSIONS` remain unchanged.
+
+| Field          | Type            | Default | Semantics                                                                                     |
+|----------------|-----------------|---------|-----------------------------------------------------------------------------------------------|
+| `pinned`       | `bool`          | `false` | Operator-set retention guard. Pinned workspaces are protected from pruning unless the operator explicitly passes `--include-pinned --confirm`. |
+| `last_used_at` | `float \| null` | `null`  | Epoch seconds of the most recent *useful* access (successful `replay_check`, export, or import). Writes do **not** update `updated_at` so "useful" is distinguishable from "mutated". |
+
+The v2 validator silently preserves unknown top-level keys; readers
+that do not understand `pinned` or `last_used_at` ignore them without
+error. Bundle pinning is recorded via a sidecar marker file
+`<bundle_path>.pinned` instead of inside the tarball, so pinning a
+bundle never changes its bytes or content hash.
+
+Canonical policy reference: [pruning_policy.md](pruning_policy.md).
+
 ---
 
 ## 3. Portable bundle (v1)

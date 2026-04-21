@@ -370,6 +370,57 @@ class SessionArchiveStore:
         doc["updated_at"] = time.time()
         self._atomic_write(self._session_dir(model_name, session_id), doc)
 
+    # ------------------------------------------------------------------
+    # Pass 6: optional operational fields (pinned, last_used_at).
+    # Both are additive, non-breaking — absence is equivalent to the
+    # default. See docs/pruning_policy.md and docs/workspace_schema.md.
+    # ------------------------------------------------------------------
+    def set_pinned(
+        self, model_name: str, session_id: str, pinned: bool
+    ) -> None:
+        """Set or clear the manifest's ``pinned`` flag (additive field).
+
+        Does not touch ``updated_at`` so toggling a pin cannot change
+        which session is considered the "latest head" for prune
+        protection.
+        """
+        doc = self.load_raw(model_name, session_id)
+        doc["pinned"] = bool(pinned)
+        self._atomic_write(self._session_dir(model_name, session_id), doc)
+
+    def is_pinned(self, model_name: str, session_id: str) -> bool:
+        """Return ``True`` iff the manifest carries ``pinned=true``."""
+        try:
+            doc = self.load_raw(model_name, session_id)
+        except SessionArchiveError:
+            return False
+        return bool(doc.get("pinned"))
+
+    def touch_last_used(
+        self,
+        model_name: str,
+        session_id: str,
+        *,
+        now: Optional[float] = None,
+    ) -> Optional[float]:
+        """Refresh the manifest's ``last_used_at`` to ``now``.
+
+        Tolerates unknown or unreadable sessions (returns ``None``).
+        Does not touch ``updated_at`` so callers can distinguish
+        "useful" from "mutated".
+        """
+        try:
+            doc = self.load_raw(model_name, session_id)
+        except SessionArchiveError:
+            return None
+        ts = float(now) if now is not None else time.time()
+        doc["last_used_at"] = ts
+        try:
+            self._atomic_write(self._session_dir(model_name, session_id), doc)
+        except OSError:
+            return None
+        return ts
+
     def fork(
         self,
         src_model_name: str,
@@ -970,6 +1021,7 @@ def replay_check(
     *,
     turn_id: Optional[str] = None,
     expected_model_name: Optional[str] = None,
+    refresh_last_used: bool = True,
 ) -> ReplayReport:
     """Validate that every block referenced by the chosen turn (default:
     head) is still present in the paged SSD cache. ``has_block`` is a
@@ -980,6 +1032,11 @@ def replay_check(
     manifest's ``model_name``, the report is graded
     ``incompatible_model`` and ``replayable=False`` without probing the
     SSD cache.
+
+    When the result grades ``healthy`` (all referenced blocks present)
+    and ``refresh_last_used`` is True (default), the manifest's
+    optional ``last_used_at`` timestamp is refreshed. Set
+    ``refresh_last_used=False`` for a strictly read-only probe.
     """
     try:
         doc = store.load_raw(model_name, session_id)
@@ -1045,6 +1102,13 @@ def replay_check(
 
     replayable = not missing
     grade = INTEGRITY_HEALTHY if replayable else INTEGRITY_MISSING_BLOCKS
+    if replayable and refresh_last_used:
+        try:
+            store.touch_last_used(model_name, session_id)
+        except Exception:
+            # touch_last_used is a best-effort side effect; never fail replay
+            # validation because the freshness timestamp could not be written.
+            pass
     return ReplayReport(
         session_id=session_id,
         model_name=model_name,

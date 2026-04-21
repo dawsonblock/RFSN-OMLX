@@ -58,12 +58,22 @@ from omlx.cache.session_archive_retention import (  # noqa: E402
     integrity_grade,
     iter_sessions,
     prune as retention_prune,
+    plan_prune as retention_plan_prune,
+    execute_plan as retention_execute_plan,
+    PRUNE_CLASS_STALE,
+    PRUNE_CLASS_INVALID,
+    PRUNE_CLASS_ORPHANED,
+    PRUNE_CLASS_EXPORTS,
+    PRUNE_CLASS_EMPTY,
+    PRUNE_CLASS_UNREADABLE,
 )
 from omlx.cache.session_archive_portable import (  # noqa: E402
     BundleError,
     export_session,
     import_session,
     inspect_bundle,
+    is_bundle_pinned,
+    set_bundle_pinned,
 )
 
 
@@ -170,6 +180,71 @@ def _build_parser() -> argparse.ArgumentParser:
         dest="dry_run",
         action="store_false",
         help="Actually delete the selected manifests.",
+    )
+    # Pass 6: structured prune classes (opt-in, conservative defaults).
+    pp.add_argument(
+        "--prune-stale",
+        action="store_true",
+        help=("Include healthy sessions older than the stale window (>30d)."),
+    )
+    pp.add_argument(
+        "--prune-invalid",
+        action="store_true",
+        help="Include manifests graded invalid past the 7d grace window.",
+    )
+    pp.add_argument(
+        "--prune-orphaned",
+        action="store_true",
+        help="Include manifest-less session dirs past the 14d grace window.",
+    )
+    pp.add_argument(
+        "--prune-empty",
+        action="store_true",
+        help="Include empty-archive manifests past the 7d grace window.",
+    )
+    pp.add_argument(
+        "--prune-unreadable",
+        action="store_true",
+        help="Include unreadable manifests past the 7d grace window.",
+    )
+    pp.add_argument(
+        "--prune-exports",
+        action="store_true",
+        help="Include portable bundles older than the 21d retention window.",
+    )
+    pp.add_argument(
+        "--bundle-dir",
+        default=None,
+        help="Directory containing *.tar / *.omlx-session.tar bundles.",
+    )
+    pp.add_argument(
+        "--include-pinned",
+        action="store_true",
+        help="Override pin protection (still requires --confirm to delete).",
+    )
+    pp.add_argument(
+        "--confirm",
+        action="store_true",
+        help="Required to actually delete (otherwise plan-only/dry-run).",
+    )
+
+    # Pass 6: pin / unpin subcommands (workspace or bundle).
+    pin_p = sub.add_parser(
+        "pin", help="Mark a workspace or bundle as pinned (never prunable)."
+    )
+    pin_p.add_argument("--model", "--model-name", dest="model", default=None)
+    pin_p.add_argument("--session", "--session-id", dest="session", default=None)
+    pin_p.add_argument(
+        "--bundle", default=None, help="Path to a portable bundle file."
+    )
+
+    unpin_p = sub.add_parser(
+        "unpin", help="Clear the pinned flag on a workspace or bundle."
+    )
+    unpin_p.add_argument("--model", "--model-name", dest="model", default=None)
+    unpin_p.add_argument("--session", "--session-id", dest="session", default=None)
+    unpin_p.add_argument(
+        "--bundle", default=None, help="Path to a portable bundle file."
     )
 
     sub.add_parser("stats", help="Print in-process session archive counters")
@@ -529,6 +604,92 @@ def _cmd_prune(
     ssd_cache: Any,
     args: argparse.Namespace,
 ) -> int:
+    # Pass 6: if any of the new structured flags are passed, route through
+    # the plan_prune / execute_plan layer. Otherwise preserve legacy
+    # behavior so existing wrappers keep working unchanged.
+    classes: list = []
+    if getattr(args, "prune_stale", False):
+        classes.append(PRUNE_CLASS_STALE)
+    if getattr(args, "prune_invalid", False):
+        classes.append(PRUNE_CLASS_INVALID)
+    if getattr(args, "prune_orphaned", False):
+        classes.append(PRUNE_CLASS_ORPHANED)
+    if getattr(args, "prune_empty", False):
+        classes.append(PRUNE_CLASS_EMPTY)
+    if getattr(args, "prune_unreadable", False):
+        classes.append(PRUNE_CLASS_UNREADABLE)
+    if getattr(args, "prune_exports", False):
+        classes.append(PRUNE_CLASS_EXPORTS)
+    use_plan_layer = bool(
+        classes
+        or getattr(args, "bundle_dir", None)
+        or getattr(args, "include_pinned", False)
+        or getattr(args, "confirm", False)
+    )
+
+    if use_plan_layer:
+        if not classes:
+            print(
+                "error: at least one --prune-* class is required when using "
+                "the structured prune layer (or --bundle-dir / --confirm / "
+                "--include-pinned)",
+                file=sys.stderr,
+            )
+            return 2
+        bundle_dir = (
+            Path(args.bundle_dir) if getattr(args, "bundle_dir", None) else None
+        )
+        plan = retention_plan_prune(
+            store,
+            ssd_cache,
+            args.model,
+            classes=classes,
+            bundle_dir=bundle_dir,
+            include_pinned=bool(getattr(args, "include_pinned", False)),
+        )
+        print(
+            f"model={plan.model_name} classes={sorted(plan.requested_classes)} "
+            f"include_pinned={plan.include_pinned} "
+            f"candidates={len(plan.candidates)} "
+            f"eligible={len(plan.eligible)} protected={len(plan.protected)}"
+        )
+        grouped = plan.eligible_by_reason()
+        for reason in sorted(grouped):
+            rows = grouped[reason]
+            print(f"  {reason} (eligible, {len(rows)}):")
+            for c in rows:
+                age_d = c.age_seconds / 86400.0
+                label = c.session_id or str(c.path)
+                print(
+                    f"    {label}\tage={age_d:.1f}d\tgrade={c.integrity_grade or '-'}"
+                )
+        for cand in plan.protected:
+            if cand.reason in (
+                "pinned",
+                "protected_latest_head",
+            ):
+                label = cand.session_id or str(cand.path)
+                print(f"  protected[{cand.reason}]\t{label}")
+
+        report = retention_execute_plan(
+            plan, store, confirm=bool(getattr(args, "confirm", False))
+        )
+        if report.dry_run:
+            print("  (dry-run — pass --confirm to delete)")
+        else:
+            print(f"  deleted={len(report.deleted)}")
+            for sid in report.deleted:
+                print(f"    {sid}")
+        if report.errors:
+            print("  errors:")
+            for sid, err in report.errors:
+                print(f"    {sid}\t{err}")
+        # Exit 1 whenever there is anything to do so CI wrappers notice.
+        if plan.eligible or report.errors:
+            return 1
+        return 0
+
+    # ---- Legacy path (unchanged) -------------------------------------
     older_than: Optional[timedelta] = args.older_than
     report = retention_prune(
         store,
@@ -568,6 +729,45 @@ def _cmd_prune(
     if report.invalid or report.expired or report.over_cap or report.errors:
         return 1
     return 0
+
+
+def _cmd_set_pin(
+    store: SessionArchiveStore, args: argparse.Namespace, pinned: bool
+) -> int:
+    bundle = getattr(args, "bundle", None)
+    model = getattr(args, "model", None)
+    session = getattr(args, "session", None)
+    if bundle:
+        if model or session:
+            print(
+                "error: pass either --bundle OR --model/--session, not both",
+                file=sys.stderr,
+            )
+            return 2
+        new_state = set_bundle_pinned(bundle, pinned)
+        print(f"bundle={bundle} pinned={new_state}")
+        return 0
+    if not (model and session):
+        print(
+            "error: pin/unpin requires either --bundle or --model AND --session",
+            file=sys.stderr,
+        )
+        return 2
+    try:
+        store.set_pinned(model, session, pinned)
+    except SessionArchiveError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    print(f"model={model} session={session} pinned={pinned}")
+    return 0
+
+
+def _cmd_pin(store: SessionArchiveStore, args: argparse.Namespace) -> int:
+    return _cmd_set_pin(store, args, True)
+
+
+def _cmd_unpin(store: SessionArchiveStore, args: argparse.Namespace) -> int:
+    return _cmd_set_pin(store, args, False)
 
 
 def _cmd_stats(_args: argparse.Namespace) -> int:
@@ -1057,6 +1257,10 @@ def main(argv: Optional[list] = None) -> int:
         return _cmd_delete(store, args)
     if args.cmd == "prune":
         return _cmd_prune(store, ssd_cache, args)
+    if args.cmd == "pin":
+        return _cmd_pin(store, args)
+    if args.cmd == "unpin":
+        return _cmd_unpin(store, args)
     if args.cmd == "stats":
         return _cmd_stats(args)
     if args.cmd == "create":

@@ -58,6 +58,9 @@ python scripts/session_archive_admin.py --archive-root <ROOT> <subcommand>
 | `validate --model M [--session S]` | Load each manifest and (when `--ssd-cache-dir` is given) check every referenced block is present. Exit `1` on any failure. |
 | `delete --model M --session S [--yes]` | Remove one session directory. Prompts unless `--yes`. |
 | `prune --model M [--invalid] [--older-than 7d] [--max-per-model 100] [--dry-run\|--no-dry-run]` | Identify (and optionally delete) invalid / expired / over-cap manifests. |
+| `prune --model M --prune-stale/--prune-invalid/--prune-orphaned/--prune-exports [--bundle-dir PATH] [--include-pinned] [--confirm]` | **Pass 6 structured prune.** Opt-in per class; dry-run unless `--confirm`. See [pruning_policy.md](pruning_policy.md). |
+| `pin --model M --session S` / `pin --bundle PATH` | Mark a workspace or bundle pinned (never prunable without `--include-pinned`). |
+| `unpin --model M --session S` / `unpin --bundle PATH` | Clear the pinned flag. |
 | `stats` | Print in-process counters from [session_archive_metrics](../omlx/cache/session_archive_metrics.py). |
 
 Exit codes: `0` OK, `1` validation / prune candidates found, `2` bad
