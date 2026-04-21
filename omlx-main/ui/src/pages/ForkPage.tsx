@@ -1,7 +1,6 @@
 import { useState } from 'react';
 import { Link, useNavigate, useParams } from 'react-router-dom';
-import { useMutation } from '@tanstack/react-query';
-import * as api from '../lib/api';
+import { useForkWorkspace } from '../hooks';
 import { ErrorBox, Section } from '../components/ui';
 
 export default function ForkPage() {
@@ -19,23 +18,29 @@ export default function ForkPage() {
     task_tag: '',
   });
 
-  const m = useMutation({
-    mutationFn: () =>
-      api.forkWorkspace(model, session, {
+  const m = useForkWorkspace(model, session);
+
+  const canSubmit =
+    form.dst_session_id.trim().length > 0 && form.branch_reason.trim().length >= 4;
+
+  const submit = () =>
+    m.mutate(
+      {
         dst_session_id: form.dst_session_id,
         branch_reason: form.branch_reason,
         at_turn: form.at_turn || null,
         label: form.label || null,
         description: form.description || null,
         task_tag: form.task_tag || null,
-      }),
-    onSuccess: (data) => {
-      navigate(`/w/${encodeURIComponent(data.model_name)}/${encodeURIComponent(data.session_id)}`);
-    },
-  });
-
-  const canSubmit =
-    form.dst_session_id.trim().length > 0 && form.branch_reason.trim().length >= 4;
+      },
+      {
+        onSuccess: (data) => {
+          navigate(
+            `/w/${encodeURIComponent(data.model_name)}/${encodeURIComponent(data.session_id)}`,
+          );
+        },
+      },
+    );
 
   return (
     <>
@@ -73,7 +78,11 @@ export default function ForkPage() {
             </div>
           ))}
           <div className="flex gap-2">
-            <button className="btn-primary" disabled={!canSubmit || m.isPending} onClick={() => m.mutate()}>
+            <button
+              className="btn-primary"
+              disabled={!canSubmit || m.isPending}
+              onClick={submit}
+            >
               Fork
             </button>
           </div>
