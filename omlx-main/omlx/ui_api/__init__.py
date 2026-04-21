@@ -16,6 +16,15 @@ Trust rules preserved verbatim from the primitives:
   rejected before any bytes land on disk.
 """
 
-from .routes import router  # noqa: F401
+from fastapi import APIRouter
+
+from .routes import router as _api_router
+from .static import router as _static_router
+
+router = APIRouter()
+router.include_router(_api_router)
+# Static SPA routes are registered AFTER the API router so the ``/ui/api``
+# prefix wins match order for any overlapping paths.
+router.include_router(_static_router)
 
 __all__ = ["router"]

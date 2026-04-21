@@ -2,7 +2,10 @@ import { defineConfig } from 'vite';
 import react from '@vitejs/plugin-react';
 
 // Dev server proxies `/ui/api` to the local FastAPI backend.
+// Production build emits assets under `/ui/` so the bundle can be served by
+// the FastAPI SPA handler at the same mount point as the API.
 export default defineConfig({
+  base: '/ui/',
   plugins: [react()],
   server: {
     port: 5173,

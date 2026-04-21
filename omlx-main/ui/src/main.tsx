@@ -6,10 +6,15 @@ import App from './App';
 import { queryClient } from './lib/queryClient';
 import './index.css';
 
+// `import.meta.env.BASE_URL` is `/` in dev (vite default) and `/ui/` in the
+// production build (see `vite.config.ts`). Strip the trailing slash for
+// react-router's `basename` prop.
+const routerBase = import.meta.env.BASE_URL.replace(/\/$/, '');
+
 ReactDOM.createRoot(document.getElementById('root')!).render(
   <React.StrictMode>
     <QueryClientProvider client={queryClient}>
-      <BrowserRouter>
+      <BrowserRouter basename={routerBase}>
         <App />
       </BrowserRouter>
     </QueryClientProvider>

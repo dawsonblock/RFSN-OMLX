@@ -14,6 +14,51 @@ Related:
 
 ---
 
+## Run the operator UI
+
+The operator SPA is served by the same `omlx serve` process at
+`/ui/`; the JSON surface lives at `/ui/api/…`. The same backend supports
+two frontends:
+
+### Production (one process)
+
+```bash
+# One-time: build the SPA into the Python package.
+bash scripts/build_ui.sh        # runs npm ci + npm run build + copies to omlx/ui_static/
+
+omlx serve                      # serves API + SPA at /ui/
+open "http://127.0.0.1:${OMLX_PORT:-8000}/ui/"
+```
+
+Asset URLs are emitted under `/ui/assets/*` (immutable cache). `/ui` (no
+slash) redirects to `/ui/`. If you start the server without building the
+bundle first, `/ui/` shows a placeholder page with build instructions —
+the API continues to work.
+
+### Development (two processes, hot reload)
+
+```bash
+# Terminal A: backend (serves /ui/api/*).
+omlx serve
+
+# Terminal B: Vite dev server with HMR, proxies /ui/api → backend.
+npm --prefix ui run dev
+open http://127.0.0.1:5173/
+```
+
+### Smoke checklist
+
+With `omlx serve` running and the SPA in a browser:
+
+1. Workspaces list renders and `GET /ui/api/workspaces` appears in the
+   Network tab.
+2. Create a workspace → it appears in the list.
+3. Open the workspace, fork to a new session, pin it.
+4. Maintenance → dry-run → `PruneReasonGroup` renders with counts.
+5. Transfers → export a workspace, then import the bundle back.
+
+---
+
 ## Environment setup
 
 Pick a model, an SSD cache root, and an archive root. All three are
