@@ -1,7 +1,8 @@
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { useWorkspaces, useCreateWorkspace } from '../hooks';
 import { ErrorBox, Grade, Loading, Section, Empty, formatTs } from '../components/ui';
+import { listModels } from '../lib/chat';
 
 const GRADES = [
   'healthy',
@@ -156,43 +157,147 @@ function CreateForm({ onDone }: { onDone: () => void }) {
     task_tag: '',
     block_size: '',
   });
+  const [availableModels, setAvailableModels] = useState<string[]>([]);
+  useEffect(() => {
+    let alive = true;
+    listModels()
+      .then((ids) => {
+        if (alive) setAvailableModels(ids);
+      })
+      .catch(() => {
+        /* no loaded models yet; user can type one in */
+      });
+    return () => {
+      alive = false;
+    };
+  }, []);
   const m = useCreateWorkspace();
+  const update = (k: keyof typeof data, v: string) => setData((d) => ({ ...d, [k]: v }));
   const submit = () =>
     m.mutate(
       {
-        model_name: data.model_name,
-        session_id: data.session_id,
-        label: data.label || null,
-        description: data.description || null,
-        task_tag: data.task_tag || null,
+        model_name: data.model_name.trim(),
+        session_id: data.session_id.trim(),
+        label: data.label.trim() || null,
+        description: data.description.trim() || null,
+        task_tag: data.task_tag.trim() || null,
         block_size: data.block_size ? Number(data.block_size) : null,
       },
       { onSuccess: onDone },
     );
   return (
     <div className="card mb-4">
-      <h3 className="mb-2 font-semibold">Create workspace</h3>
-      <div className="grid grid-cols-2 gap-3">
-        {(['model_name', 'session_id', 'label', 'description', 'task_tag', 'block_size'] as const).map(
-          (k) => (
-            <div key={k}>
-              <label className="label">{k}</label>
-              <input
-                className="input"
-                value={(data as Record<string, string>)[k]}
-                onChange={(e) => setData({ ...data, [k]: e.target.value })}
-              />
-            </div>
-          ),
-        )}
+      <h3 className="mb-1 font-semibold">Create workspace</h3>
+      <p className="mb-3 text-xs text-neutral-500">
+        A workspace is a persistent (model, session) pair whose KV cache is archived on
+        disk. Only the first two fields are required. See the{' '}
+        <a href="/ui/help" className="underline">Help tab</a> for details.
+      </p>
+
+      <div className="mb-2 text-[11px] font-semibold uppercase tracking-wider text-neutral-500">
+        Required
       </div>
-      <div className="mt-3 flex gap-2">
+      <div className="mb-4 grid grid-cols-1 gap-3 md:grid-cols-2">
+        <div>
+          <label className="label">Model <span className="text-red-600">*</span></label>
+          {availableModels.length > 0 ? (
+            <select
+              className="input"
+              value={data.model_name}
+              onChange={(e) => update('model_name', e.target.value)}
+            >
+              <option value="">— pick a loaded model —</option>
+              {availableModels.map((mm) => (
+                <option key={mm} value={mm}>
+                  {mm}
+                </option>
+              ))}
+            </select>
+          ) : (
+            <input
+              className="input"
+              value={data.model_name}
+              placeholder="e.g. llama"
+              onChange={(e) => update('model_name', e.target.value)}
+            />
+          )}
+          <p className="mt-1 text-xs text-neutral-500">
+            The runtime id you see in the Chat model dropdown (not the HuggingFace
+            repo id).
+          </p>
+        </div>
+        <div>
+          <label className="label">Session ID <span className="text-red-600">*</span></label>
+          <input
+            className="input"
+            value={data.session_id}
+            placeholder="e.g. notes, debug-1, ticket-4821"
+            onChange={(e) => update('session_id', e.target.value)}
+          />
+          <p className="mt-1 text-xs text-neutral-500">
+            Unique within this model. Treat it like a filename.
+          </p>
+        </div>
+      </div>
+
+      <div className="mb-2 text-[11px] font-semibold uppercase tracking-wider text-neutral-500">
+        Optional
+      </div>
+      <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
+        <div>
+          <label className="label">Label</label>
+          <input
+            className="input"
+            value={data.label}
+            placeholder="Human-readable title"
+            onChange={(e) => update('label', e.target.value)}
+          />
+        </div>
+        <div>
+          <label className="label">Description</label>
+          <input
+            className="input"
+            value={data.description}
+            placeholder="What is this workspace for?"
+            onChange={(e) => update('description', e.target.value)}
+          />
+        </div>
+        <div>
+          <label className="label">Task tag</label>
+          <input
+            className="input"
+            value={data.task_tag}
+            placeholder="e.g. eval, demo, keep"
+            onChange={(e) => update('task_tag', e.target.value)}
+          />
+          <p className="mt-1 text-xs text-neutral-500">
+            Used by pruning policies and export filters.
+          </p>
+        </div>
+        <div>
+          <label className="label">KV block size (tokens)</label>
+          <input
+            className="input"
+            type="number"
+            min="1"
+            value={data.block_size}
+            placeholder="default (256)"
+            onChange={(e) => update('block_size', e.target.value)}
+          />
+          <p className="mt-1 text-xs text-neutral-500">
+            Smaller = finer fork points, more disk. Leave blank unless you have a
+            reason.
+          </p>
+        </div>
+      </div>
+
+      <div className="mt-4 flex gap-2">
         <button
           className="btn-primary"
-          disabled={!data.model_name || !data.session_id || m.isPending}
+          disabled={!data.model_name.trim() || !data.session_id.trim() || m.isPending}
           onClick={submit}
         >
-          Create
+          {m.isPending ? 'Creating…' : 'Create'}
         </button>
       </div>
       {m.error && (

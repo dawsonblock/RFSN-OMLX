@@ -10,6 +10,8 @@ import Transfers from './pages/Transfers';
 import Maintenance from './pages/Maintenance';
 import SettingsPage from './pages/SettingsPage';
 import ModelsPage from './pages/ModelsPage';
+import ChatPage from './pages/ChatPage';
+import HelpPage from './pages/HelpPage';
 
 export default function App() {
   return (
@@ -23,8 +25,10 @@ export default function App() {
         <Route path="/diff" element={<DiffPage />} />
         <Route path="/transfers" element={<Transfers />} />
         <Route path="/maintenance" element={<Maintenance />} />
+        <Route path="/chat" element={<ChatPage />} />
         <Route path="/models" element={<ModelsPage />} />
         <Route path="/settings" element={<SettingsPage />} />
+        <Route path="/help" element={<HelpPage />} />
       </Routes>
     </AppShell>
   );
