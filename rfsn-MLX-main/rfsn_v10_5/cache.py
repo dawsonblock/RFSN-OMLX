@@ -1,19 +1,20 @@
-"""Exact per-layer KV cache with block-managed archival storage.
+"""
+Exact per-layer KV cache with block-managed archival storage.
 
-Phase 1 replaces the old archive-and-reconstruct design with a single
-exact path:
+Session archive contract (reference implementation):
+- The session archive is a best-effort, implementation-defined feature. Canonical contract is owned by omlx-main.
+- If restore=True, an explicit session_id is required. If missing, ValueError is raised.
+- If restore=True and the archive is missing, incomplete, or corrupt, ValueError is raised.
+- Error vocabulary for contract violations is ValueError; implementation errors may raise RuntimeError or others.
 
-- the hot tier is a rolling exact window in device memory,
-- sealed prefixes become exact archived blocks registered in a
-  ``BlockManager``,
-- warm archived blocks stay in RAM,
-- cold archived blocks live only on disk and are loaded lazily,
-- attention consumes narrow segment views rather than a monolithic
-  reconstructed archive tensor.
+Phase 1 replaces the old archive-and-reconstruct design with a single exact path:
+- The hot tier is a rolling exact window in device memory.
+- Sealed prefixes become exact archived blocks registered in a BlockManager.
+- Warm archived blocks stay in RAM.
+- Cold archived blocks live only on disk and are loaded lazily.
+- Attention consumes narrow segment views rather than a monolithic reconstructed archive tensor.
 
-The runtime authority for archived context is the page table owned by
-``BlockManager``. Any concatenation helpers in this module are debug-only
-views built on top of that metadata and are not used by the hot path.
+The runtime authority for archived context is the page table owned by BlockManager. Any concatenation helpers in this module are debug-only views built on top of that metadata and are not used by the hot path.
 """
 
 from __future__ import annotations

@@ -31,7 +31,8 @@ class GenerateRequest(BaseModel):
     messages: Optional[list[dict[str, Any]]] = None
     prompt_ids: Optional[list[int]] = None
     session_id: Optional[str] = None
-    restore_cache: bool = False
+    # Canonical: omlx-main owns the session archive contract. Reference: restore_cache is a best-effort hint.
+    restore_cache: bool = False  # If True, attempt to restore session archive if session_id is provided.
     max_new_tokens: int = Field(default=50, ge=1)
     temperature: float = Field(default=1.0, ge=0.0)
     top_p: float = Field(default=1.0, ge=0.0, le=1.0)
@@ -129,6 +130,13 @@ class RFSNAPIService:
         restore_cache: bool = False,
         session_id: Optional[str] = None,
     ) -> RFSNCache:
+        """
+        Build a cache for the current request. If restore_cache is True and session_id is provided,
+        attempt to restore the session archive from disk. If restore_cache is True but session_id is missing,
+        raise ValueError to match the canonical contract. If restore_cache is False, always start fresh.
+        """
+        if restore_cache and not session_id:
+            raise ValueError("restore_cache requires an explicit session_id so the persisted archive can be resolved safely")
         cache = RFSNCache(
             self.config,
             batch_size=batch_size,
@@ -136,7 +144,11 @@ class RFSNAPIService:
             restore=restore_cache,
         )
         if restore_cache:
-            cache.restore_from_disk()
+            try:
+                cache.restore_from_disk()
+            except Exception as exc:
+                # Canonical: error vocabulary is implementation-defined, but ValueError is preferred for contract violations
+                raise ValueError(f"Failed to restore session archive: {exc}") from exc
         return cache
 
     def _prepare_prompt_ids(self, request: GenerateRequest) -> mx.array:
