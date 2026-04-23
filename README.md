@@ -19,12 +19,16 @@
 
 | Project | Role | Status |
 | --- | --- | --- |
-| [**`omlx-main`**](omlx-main) | Production-grade OpenAI-compatible server with continuous batching, tiered KV cache, VLM/OCR/embedding support, and a native macOS menubar app. | Actively released (Homebrew, `.dmg`). |
-| [**`rfsn-MLX-main`**](rfsn-MLX-main) | Minimal, first-principles MLX transformer engine used as an inference-systems playground — exact segmented attention, block-managed KV archive, session-scoped restart restore. | Research / reference implementation. |
+| [**`omlx-main`**](omlx-main) | **Canonical product runtime.** OpenAI-compatible server with continuous batching, tiered KV cache, VLM/OCR/embedding support, and a native macOS menubar app. | Actively released (Homebrew, `.dmg`). |
+| [**`rfsn-MLX-main`**](rfsn-MLX-main) | **Research/reference runtime.** Minimal, first-principles MLX transformer engine — exact segmented attention, block-managed KV archive, session-scoped restart restore. | Research / reference only. |
+
 
 The two share a common design philosophy: **make KV state explicit, durable, and restartable**, so long-context conversations survive process boundaries without recomputation.
 
-This monorepo is the place where cross-cutting work — session archive contracts, SSD-cache integrity invariants, Apple Silicon benchmarking — is authored and tested against both runtimes.
+**`omlx-main` is the canonical product runtime and the authority for the public session archive contract.**
+`rfsn-MLX-main` is a research/reference implementation for experimental attention and archive strategies. All public contract and persisted archive decisions are owned by `omlx-main`.
+
+This monorepo is the place where cross-cutting work — session archive contracts, SSD-cache integrity invariants, Apple Silicon benchmarking — is authored and tested, but the product contract is always defined by `omlx-main`.
 
 ---
 
@@ -34,7 +38,7 @@ This monorepo is the place where cross-cutting work — session archive contract
 RFSN-OMLX/
 ├── omlx-main/          # Production serving stack (see omlx-main/README.md)
 │   ├── omlx/           # Python package: scheduler, cache, API, admin UI
-│   ├── tests/          # ~3,700 pytest tests (see "Development" below)
+│   ├── tests/          # pytest tests (see "Development" below; count varies by branch and environment)
 │   ├── packaging/      # venvstacks + py2app packaging for the .dmg
 │   ├── Formula/        # Homebrew formula
 │   └── pyproject.toml
@@ -43,6 +47,22 @@ RFSN-OMLX/
 │   └── tests/
 └── README.md           # This file
 ```
+
+---
+
+
+---
+
+## Session Archive Contract
+
+The **session archive contract** is defined by `omlx-main`. It guarantees:
+
+- Explicit, opt-in session archiving and restore via the public API
+- Archive manifests and block payloads in a canonical, forward-compatible format
+- Strict failure semantics: unknown session, empty archive, gapped archive, unreadable block all fail closed
+- No partial or best-effort restore: either the full session is restored, or the request fails
+
+`rfsn-MLX-main` may provide experimental or legacy archive support, but the public contract and vocabulary are always those of `omlx-main`.
 
 ---
 
@@ -154,7 +174,7 @@ pip install -e ".[dev]"
 ### Run the test suite
 
 ```bash
-# Full collection (should report ~3,700 collected, 0 errors)
+# Full collection (test count varies by branch and environment)
 python -m pytest --collect-only -q
 
 # Targeted runs — session-archive contract
